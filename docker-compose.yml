@@ -1,0 +1,32 @@
+version: "3.9"
+
+# NOTE: Only Valkey runs here. Postgres is NOT included because production
+# uses Supabase's hosted Postgres (with its connection pooler) -- running a
+# local Postgres in Docker for dev is optional; use it if you don't already
+# have Postgres installed locally, by uncommenting the service below.
+
+services:
+  valkey:
+    image: valkey/valkey:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    volumes:
+      - valkey_data:/data
+
+  # Uncomment for a fully local Postgres instead of Supabase during dev:
+  # postgres:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: app_user
+  #     POSTGRES_PASSWORD: localdevpass
+  #     POSTGRES_DB: infosenior_care
+  #   ports:
+  #     - "5432:5432"
+  #   restart: unless-stopped
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  valkey_data:
+  # postgres_data:

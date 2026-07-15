@@ -47,8 +47,23 @@
 #     # file imports idempotent.
 #     dedup_hash: Mapped[str] = mapped_column(String(64), nullable=False)
 
+#     # The SOURCE file's own row identifier (its "uuid" column). Confirmed
+#     # stable across re-exports of this specific data pipeline (unlike a
+#     # typical external uuid, which usually regenerates per export) -- so
+#     # this is actually the MOST reliable match key across re-imports,
+#     # taking priority over ccn/dedup_hash in scripts/import_facilities.py.
+#     # It is intentionally separate from our own `id` primary key (which
+#     # stays ours to fully control) so a source-side re-export can never
+#     # collide with or dictate our internal primary key values.
+#     source_uuid: Mapped[str | None] = mapped_column(String(64), index=True)
+
 #     name: Mapped[str] = mapped_column(String(500), nullable=False)
 #     facility_type: Mapped[str | None] = mapped_column(String(200), index=True)
+#     # Standardized/cleaned bucket (small fixed set, e.g. "Nursing Home /
+#     # Skilled Nursing Facility", "Home Health Agency", "Hospice") -- this is
+#     # what the frontend's hardcoded filter dropdown sends, as opposed to
+#     # `facility_type` which is raw/messy source text with many variants.
+#     facility_type_category: Mapped[str | None] = mapped_column(String(100), index=True)
 #     legal_business_name: Mapped[str | None] = mapped_column(String(500))
 #     ownership_type: Mapped[str | None] = mapped_column(String(200))
 
@@ -57,6 +72,7 @@
 #     state: Mapped[str | None] = mapped_column(String(2), index=True)
 #     zip_code: Mapped[str | None] = mapped_column(String(20), index=True)
 #     county: Mapped[str | None] = mapped_column(String(200))
+
 
 #     phone: Mapped[str | None] = mapped_column(String(30))
 #     email: Mapped[str | None] = mapped_column(String(300))
@@ -235,7 +251,6 @@
 
 
 
-
 """
 Facility models -- normalized to avoid one giant sparse 95-column table.
 
@@ -318,12 +333,31 @@ class Facility(Base):
     facility_subtype: Mapped[str | None] = mapped_column(String(200))
     operating_status: Mapped[str | None] = mapped_column(String(50))
     closed_date: Mapped[str | None] = mapped_column(String(30))
+    certification_date: Mapped[str | None] = mapped_column(String(30))
 
     latitude: Mapped[float | None] = mapped_column(Float)
     longitude: Mapped[float | None] = mapped_column(Float)
 
     bed_count: Mapped[int | None] = mapped_column(Integer)
+    # Dementia/memory-care-specific secure bed capacity -- distinct from
+    # the general bed_count; only populated for facilities that offer a
+    # secure memory care unit.
+    secure_memory_care_beds: Mapped[int | None] = mapped_column(Integer)
     overall_rating: Mapped[float | None] = mapped_column(Float)
+    # CMS's own regional grouping number for the facility (source data
+    # provides this as e.g. "4.0" -- coerced to a plain integer).
+    cms_region: Mapped[int | None] = mapped_column(Integer)
+    # Free-text notes from the source file about specialty services/focus
+    # areas not otherwise captured in a structured column.
+    specialty_notes: Mapped[str | None] = mapped_column(Text)
+    # Which STATE'S source data file this row was extracted from -- this is
+    # NOT always the same as the facility's actual physical `state` (e.g. a
+    # multi-state provider's HQ record can appear in another state's
+    # directory file). Kept separate from `state` deliberately: `state`
+    # drives location search/filtering (the physical address), while this
+    # is provenance/data-quality metadata only -- never use this for
+    # location filtering.
+    source_state_abbr: Mapped[str | None] = mapped_column(String(2))
 
     data_source: Mapped[str | None] = mapped_column(String(300))
     source_file: Mapped[str | None] = mapped_column(String(300))

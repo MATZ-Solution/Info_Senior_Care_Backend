@@ -41,8 +41,8 @@
 # BATCH_SIZE = 500
 
 # CORE_COLUMNS = [
-#     "ccn", "name", "facility_type", "legal_business_name", "ownership_type",
-#     "address", "city", "state", "zip_code", "county", "phone", "email",
+#     "ccn", "name", "facility_type", "facility_type_category", "legal_business_name",
+#     "ownership_type", "address", "city", "state", "zip_code", "county", "phone", "email",
 #     "facility_subtype", "operating_status", "closed_date", "latitude",
 #     "longitude", "bed_count", "overall_rating", "data_source", "source_file",
 #     "schema_version", "load_timestamp",
@@ -217,7 +217,17 @@
 #     """
 #     Upserts one batch into `facilities` using a staging-table
 #     UPDATE-then-INSERT pattern, matching each incoming row against existing
-#     facilities by `ccn` OR `dedup_hash` (whichever matches).
+#     facilities by (in priority order) `source_uuid`, then `ccn`, then
+#     `dedup_hash`.
+
+#     `source_uuid` (the source file's own row id) is checked FIRST because
+#     it's confirmed stable across re-exports of this data pipeline, unlike
+#     `dedup_hash` -- which is derived from name+address+zip+state+type, so it
+#     CHANGES if a later file cleans up/standardizes any of those fields (e.g.
+#     a facility_type text correction). Without source_uuid-first matching, a
+#     file that only fixes facility_type text would look like brand-new
+#     facilities to the dedup_hash check and get inserted as duplicates
+#     instead of updating the existing rows.
 
 #     Why not a plain `INSERT ... ON CONFLICT`: real data contains the SAME
 #     physical facility listed twice under different sources -- e.g. a state
@@ -242,6 +252,7 @@
 #     staging_cols = ["row_seq"] + core_cols
 #     col_type_map = {
 #         "row_seq": "INTEGER", "id": "UUID", "dedup_hash": "TEXT", "ccn": "TEXT",
+#         "source_uuid": "TEXT",
 #         "latitude": "DOUBLE PRECISION", "longitude": "DOUBLE PRECISION",
 #         "bed_count": "INTEGER", "overall_rating": "DOUBLE PRECISION",
 #         "extra_attributes": "JSONB", "is_active": "BOOLEAN",
@@ -261,7 +272,8 @@
 #         staging_values,
 #     )
 
-#     # ---- Step 1: UPDATE existing facilities matched by ccn OR dedup_hash ----
+#     # ---- Step 1: UPDATE existing facilities, matched by source_uuid first,
+#     # falling back to ccn, then dedup_hash ----
 #     update_cols = [c for c in core_cols if c not in ("id", "dedup_hash", "ccn", "is_active")]
 #     set_clause = ", ".join(f"{c} = s.{c}" for c in update_cols)
 #     cur.execute(
@@ -271,7 +283,9 @@
 #             ccn = COALESCE(f.ccn, s.ccn),
 #             updated_at = now()
 #         FROM batch_staging s
-#         WHERE (s.ccn IS NOT NULL AND f.ccn = s.ccn) OR f.dedup_hash = s.dedup_hash
+#         WHERE (s.source_uuid IS NOT NULL AND f.source_uuid = s.source_uuid)
+#            OR (s.ccn IS NOT NULL AND f.ccn = s.ccn)
+#            OR f.dedup_hash = s.dedup_hash
 #         RETURNING f.id, s.row_seq
 #         """
 #     )
@@ -336,6 +350,7 @@
 #         core = {c: coerce(c, raw.get(c)) for c in CORE_COLUMNS}
 #         core["ccn"] = clean(raw.get("ccn"))
 #         core["id"] = str(uuid.uuid4())
+#         core["source_uuid"] = clean(raw.get("uuid"))
 #         core["dedup_hash"] = compute_dedup_hash(
 #             name=raw.get("name"), address=raw.get("address"),
 #             zip_code=core["zip_code"], state=raw.get("state"),
@@ -351,7 +366,7 @@
 
 #         prepared.append({**core, "nh": nh, "hh": hh, "services": services})
 
-#     core_cols_with_extra = CORE_COLUMNS + ["extra_attributes", "is_active"]
+#     core_cols_with_extra = CORE_COLUMNS + ["source_uuid", "extra_attributes", "is_active"]
 #     facility_results = upsert_batch(cur, prepared, core_cols_with_extra, report)
 
 #     upsert_detail_table(cur, "nursing_home_details", NH_COLUMNS,
@@ -440,6 +455,19 @@
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 """
 Idempotent facility data importer.
 
@@ -485,9 +513,10 @@ BATCH_SIZE = 500
 CORE_COLUMNS = [
     "ccn", "name", "facility_type", "facility_type_category", "legal_business_name",
     "ownership_type", "address", "city", "state", "zip_code", "county", "phone", "email",
-    "facility_subtype", "operating_status", "closed_date", "latitude",
-    "longitude", "bed_count", "overall_rating", "data_source", "source_file",
-    "schema_version", "load_timestamp",
+    "facility_subtype", "operating_status", "closed_date", "certification_date",
+    "latitude", "longitude", "bed_count", "secure_memory_care_beds", "overall_rating",
+    "cms_region", "specialty_notes", "source_state_abbr",
+    "data_source", "source_file", "schema_version", "load_timestamp",
 ]
 
 NH_COLUMNS = [
@@ -528,7 +557,8 @@ SERVICE_COLUMNS = [
 ]
 
 INT_FIELDS = {
-    "bed_count", "nh_total_certified_beds", "nh_number_of_fines",
+    "bed_count", "secure_memory_care_beds", "cms_region",
+    "nh_total_certified_beds", "nh_number_of_fines",
     "nh_medicare_payment_denials", "nh_total_penalties",
     "nh_infection_control_citations", "nh_health_deficiencies_latest",
     "nh_administrators_left_12mo",
@@ -696,7 +726,8 @@ def upsert_batch(cur, rows: list[dict], core_cols_with_extra: list[str], report:
         "row_seq": "INTEGER", "id": "UUID", "dedup_hash": "TEXT", "ccn": "TEXT",
         "source_uuid": "TEXT",
         "latitude": "DOUBLE PRECISION", "longitude": "DOUBLE PRECISION",
-        "bed_count": "INTEGER", "overall_rating": "DOUBLE PRECISION",
+        "bed_count": "INTEGER", "secure_memory_care_beds": "INTEGER", "cms_region": "INTEGER",
+        "overall_rating": "DOUBLE PRECISION",
         "extra_attributes": "JSONB", "is_active": "BOOLEAN",
     }
     staging_col_defs = ", ".join(

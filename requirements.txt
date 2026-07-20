@@ -2,8 +2,10 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 gunicorn==23.0.0
 sqlalchemy==2.0.35
-asyncpg==0.29.0
-psycopg2-binary==2.9.9
+# asyncpg==0.29.0
+asyncpg>=0.31.0
+# psycopg2-binary==2.9.9
+psycopg[binary]
 alembic==1.13.3
 pydantic==2.9.2
 pydantic-settings==2.5.2
@@ -14,8 +16,20 @@ slowapi==0.1.9
 httpx==0.27.2
 python-multipart==0.0.9
 sentry-sdk[fastapi]==2.14.0
-python-dotenv==1.0.1
+python-dotenv>=1.2.2
 orjson==3.10.7
 itsdangerous==2.2.0
 pytest==8.3.3
 pytest-asyncio==0.24.0
+langchain>=0.3.27
+langchain-core>=0.3.75
+langchain-cerebras
+langchain-groq>=0.3.0
+gspread>=6.2.1
+google-auth>=2.49.1
+resend>=2.26.0
+jsonschema>=4.26.0
+qdrant-client>=1.12.0
+aiohttp
+loguru>=0.7.3
+requests

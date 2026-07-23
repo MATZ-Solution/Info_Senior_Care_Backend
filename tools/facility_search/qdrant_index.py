@@ -15,7 +15,7 @@ from tools.facility_search.retry import retry_async
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-COLLECTION_NAME = "facilities"
+COLLECTION_NAME = "facilities_data"
 
 # Every field search.py filters on -- Qdrant Cloud requires an explicit
 # payload index per field to filter on it at all ("Index required but not

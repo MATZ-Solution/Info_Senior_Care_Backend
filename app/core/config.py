@@ -32,6 +32,7 @@ class Settings(BaseSettings):
 
     # ---- Database ----
     DATABASE_URL: str
+    ASYNC_DATABASE_URL: str
     MIGRATION_DATABASE_URL: str
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 10

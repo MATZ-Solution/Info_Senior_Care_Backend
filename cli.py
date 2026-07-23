@@ -3,10 +3,15 @@
 CLI harness for testing the Infomary chat agent without the frontend.
 
 Runs the exact same per-turn agent loop as the `/ws/{session_id}` handler in
-main.py (same LLM, same tools, same leaked-tool-call retry/dedupe/disclosure
+app/main.py (same LLM, same tools, same leaked-tool-call retry/dedupe/disclosure
 handling, same "rebuild messages from plain history each turn" approach) but
 reads/writes the terminal instead of a WebSocket, and doesn't persist to
 Postgres.
+
+Note: app/main.py now also wires up Sentry, rate limiting, and settings-based
+config for its FastAPI routes, but none of that touches the agent loop itself
+-- this CLI intentionally stays on the plain os.getenv/root-database.py path
+since it doesn't run through FastAPI at all.
 
 Usage:
     uv run cli.py
@@ -74,7 +79,7 @@ def _print_cards(cards: list[dict]) -> None:
 async def run_turn(system_prompt: str, history: list[dict], user_message: str) -> tuple[str, list[dict]]:
     """Runs one full agent turn (including any tool-calling rounds) and
     returns (assistant_text, facility_cards). Mirrors websocket_endpoint in
-    main.py: `messages` is rebuilt fresh from plain-text `history` each call,
+    app/main.py: `messages` is rebuilt fresh from plain-text `history` each call,
     tool-call/tool-response messages never leak into the persisted history."""
     messages: list = [SystemMessage(content=system_prompt)]
     for msg in history[-MAX_HISTORY_MESSAGES:]:

@@ -156,7 +156,7 @@ class Base(DeclarativeBase):
 
 
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    settings.ASYNC_DATABASE_URL,
     poolclass=NullPool,
     echo=False,
     connect_args={

@@ -170,7 +170,7 @@ async def lifespan(app: FastAPI):
     await init_db_pool()
     log_startup("Provisioning facility search tables...")
     await ensure_facility_search_ready()
-    log_startup(f"LLM model: llama-3.3-70b-versatile")
+    log_startup(f"LLM model: openai/gpt-oss-120b")
     log_startup(f"Tools bound: google_search, save_lead, facility_search")
     log_divider("READY")
     yield

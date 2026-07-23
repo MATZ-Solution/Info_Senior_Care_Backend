@@ -9,6 +9,7 @@ from datetime import date
 
 from tools.facility_search.transforms import (
     zero_pad_5, normalize_ownership, parse_cms_date, to_int, to_float, to_text,
+    title_case, upper_trim, passthrough_json,
 )
 
 passed = 0
@@ -76,6 +77,29 @@ print("\n--- to_text ---")
 check("strips whitespace", to_text("  Sunrise Manor  "), "Sunrise Manor")
 check("blank -> None", to_text(""), None)
 check("N/A -> None", to_text("N/A"), None)
+
+print("\n--- title_case (Phase 11 -- city/county casing) ---")
+check("all caps -> title case", title_case("PHOENIX"), "Phoenix")
+check("all lower -> title case", title_case("phoenix"), "Phoenix")
+check("multi-word", title_case("  new york city  "), "New York City")
+check("blank -> None", title_case(""), None)
+check("None -> None", title_case(None), None)
+
+print("\n--- upper_trim (Phase 11 -- state casing) ---")
+check("lowercase -> upper", upper_trim("az"), "AZ")
+check("mixed case with whitespace", upper_trim("  Az "), "AZ")
+check("blank -> None", upper_trim(""), None)
+check("None -> None", upper_trim(None), None)
+
+print("\n--- passthrough_json (Phase 11 -- opaque source_extra catch-all) ---")
+check("JSON object STRING (asyncpg's real jsonb-without-codec shape) parses to dict",
+      passthrough_json('{"a": 1}'), {"a": 1})
+check("JSON array string parses to list", passthrough_json("[1, 2]"), [1, 2])
+check("already-decoded dict passes through unchanged (defensive)", passthrough_json({"a": 1}), {"a": 1})
+check("already-decoded list passes through unchanged (defensive)", passthrough_json([1, 2]), [1, 2])
+check("blank -> None", passthrough_json(""), None)
+check("None -> None", passthrough_json(None), None)
+check_raises("non-JSON garbage string raises", passthrough_json, "not{valid]json")
 
 print(f"\n{passed} passed, {failed} failed")
 if failed:

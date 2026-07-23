@@ -19,7 +19,12 @@ argued explicitly rather than accidental:
 Each builder takes (facility: dict, attributes: dict) -> str and must never
 raise for missing/null fields -- absent data is omitted from the sentence, not
 rendered as "None". schemas.py is the source of truth for which attributes
-keys can even exist per type; hospice/irf intentionally have none (_EMPTY).
+keys can even exist per type.
+
+Phase 11 -- All_State_Type_combined maps overall_rating and the shared "offers"
+sub-object unconditionally for every type (schemas.py's _BASE_PROPERTIES), so
+_shared_facts() below is folded into every builder, not just the ones with
+their own type-specific fields.
 """
 
 TYPE_LABELS = {
@@ -28,6 +33,17 @@ TYPE_LABELS = {
     "hospice": "hospice provider",
     "irf": "inpatient rehabilitation facility",
     "ltch": "long-term care hospital",
+    "assisted_living": "assisted living facility",
+    "icf_iid": "intermediate care facility",
+    "home_care": "home care agency",
+    "adult_day_care": "adult day care center",
+    "behavioral_health": "behavioral health facility",
+    "outpatient_rehab": "outpatient rehabilitation center",
+    "hospital": "hospital",
+    "dialysis_center": "dialysis center",
+    "ambulatory_surgery_center": "ambulatory surgery center",
+    "nursing_staffing_agency": "nursing staffing agency",
+    "other_specialty": "specialty facility",
 }
 
 OWNERSHIP_ADJ = {
@@ -55,48 +71,49 @@ def _join_facts(opening: str, facts: list) -> str:
     return ". ".join(parts) + "."
 
 
+# Phase 11 -- overall_rating + the shared "offers" sub-object are mapped
+# unconditionally for every facility_type (schemas.py's _BASE_PROPERTIES), so
+# every builder below folds these facts in, not just the types with nothing
+# else. Absent/null values are simply omitted, never rendered as "None".
+def _shared_facts(attributes: dict) -> list[str]:
+    facts = []
+    overall = attributes.get("overall_rating")
+    if overall is not None:
+        facts.append(f"Overall rating {overall}/5")
+    offers = attributes.get("offers") or {}
+    offered = [name.replace("_", " ") for name, val in offers.items() if val]
+    if offered:
+        facts.append(f"also offering {', '.join(offered)}")
+    return facts
+
+
 def _nursing_home(facility: dict, attributes: dict) -> str:
     opening = _opening("nursing_home", facility)
-    beds = attributes.get("certified_beds")
-    avg = attributes.get("avg_residents_per_day")
-    if beds is not None and avg is not None:
-        opening += f" with {beds} certified beds, averaging {avg} residents daily"
-    elif beds is not None:
+    beds = attributes.get("total_certified_beds")
+    if beds is not None:
         opening += f" with {beds} certified beds"
 
-    facts = []
+    facts = list(_shared_facts(attributes))
 
-    ratings = attributes.get("ratings") or {}
-    overall = ratings.get("overall")
-    if overall is not None:
-        sub = [
-            f"{label} {ratings[key]}/5"
-            for key, label in (("staffing", "staffing"), ("health_inspection", "health inspections"), ("qm", "quality measures"))
-            if ratings.get(key) is not None
-        ]
-        facts.append(f"Overall CMS rating {overall}/5 ({', '.join(sub)})" if sub else f"Overall CMS rating {overall}/5")
+    sub = [
+        f"{label} {attributes[key]}/5"
+        for key, label in (
+            ("staffing_rating", "staffing"),
+            ("health_inspection_rating", "health inspections"),
+            ("quality_measure_rating", "quality measures"),
+        )
+        if attributes.get(key) is not None
+    ]
+    if sub:
+        facts.append(", ".join(sub).capitalize())
 
-    staffing_hours = attributes.get("staffing_hours") or {}
-    rn = staffing_hours.get("rn")
-    if rn is not None:
-        facts.append(f"Reported RN staffing of {rn} hours per resident per day")
+    chain = attributes.get("chain_affiliation")
+    if chain:
+        facts.append(f"Chain affiliation: {chain}")
 
-    fines = attributes.get("number_of_fines")
-    penalties = attributes.get("total_penalties")
-    if fines is not None or penalties is not None:
-        bits = []
-        if fines is not None:
-            bits.append(f"{fines} fine{'s' if fines != 1 else ''} on record")
-        if penalties is not None:
-            bits.append(f"{penalties} total penalt{'ies' if penalties != 1 else 'y'}")
-        facts.append(", ".join(bits).capitalize())
-
-    special = attributes.get("special_focus_status")
-    if special:
-        facts.append(f"Special focus status: {special}")
-    abuse = attributes.get("abuse_icon")
-    if abuse:
-        facts.append(f"Abuse citation flag: {abuse}")
+    assessment = attributes.get("staffing_level_assessment")
+    if assessment:
+        facts.append(f"Staffing level assessment: {assessment}")
 
     year = _cert_year(facility)
     if year:
@@ -107,30 +124,23 @@ def _nursing_home(facility: dict, attributes: dict) -> str:
 
 def _home_health(facility: dict, attributes: dict) -> str:
     opening = _opening("home_health", facility)
-    facts = []
+    facts = list(_shared_facts(attributes))
 
-    services = attributes.get("services") or {}
-    offered = [name.replace("_", " ") for name, val in services.items() if val]
+    service_fields = (
+        ("offers_nursing_care", "nursing care"),
+        ("offers_physical_therapy", "physical therapy"),
+        ("offers_occupational_therapy", "occupational therapy"),
+        ("offers_speech_therapy", "speech therapy"),
+        ("offers_medical_social_services", "medical social services"),
+        ("offers_home_health_aides", "home health aides"),
+    )
+    offered = [label for key, label in service_fields if attributes.get(key)]
     if offered:
-        facts.append(f"offering {', '.join(offered)} services")
+        facts.append(f"offering {', '.join(offered)}")
 
-    rating = attributes.get("quality_star_rating")
-    if rating is not None:
-        facts.append(f"quality of patient care rating {rating}/5")
-
-    for key, label in (
-        ("discharge_to_community_category", "discharge-to-community performance"),
-        ("readmission_category", "readmission performance"),
-        ("preventable_hospitalization_category", "preventable hospitalization performance"),
-    ):
-        val = attributes.get(key)
-        if val:
-            facts.append(f"{label} categorized as '{val}'")
-
-    outcomes = attributes.get("outcomes") or {}
-    for name, val in outcomes.items():
-        if val:
-            facts.append(f"{name.replace('_', ' ')}: {val}")
+    discharge = attributes.get("home_discharge_success")
+    if discharge is not None:
+        facts.append(f"home discharge success rate {discharge}")
 
     year = _cert_year(facility)
     if year:
@@ -139,15 +149,40 @@ def _home_health(facility: dict, attributes: dict) -> str:
     return _join_facts(opening, facts)
 
 
-def _thin_type(facility_type: str):
+def _generic(facility_type: str):
+    """
+    Every type with no combined-source columns beyond the shared base
+    (overall_rating/offers/source_extra) -- hospice, irf, and all Phase 11
+    additions except nursing_home/home_health.
+    """
     def build(facility: dict, attributes: dict) -> str:
         opening = _opening(facility_type, facility)
+        facts = list(_shared_facts(attributes))
         year = _cert_year(facility)
-        facts = [f"certified since {year}"] if year else []
+        if year:
+            facts.append(f"certified since {year}")
         return _join_facts(opening, facts)
     return build
 
 
+def _nursing_staffing_agency(facility: dict, attributes: dict) -> str:
+    """
+    Explicit, not implied -- this is a B2B staffing vendor supplying nurses TO
+    facilities, not somewhere a patient resides or receives care. Stated
+    plainly in the generated content itself (the text the LLM actually sees
+    and paraphrases from), so it can't get presented as a place someone can
+    move into -- same honesty standard already applied to thin types.
+    """
+    opening = _opening("nursing_staffing_agency", facility)
+    opening += " -- a staffing vendor that supplies nursing staff to other facilities, not a residence or direct-care location"
+    facts = list(_shared_facts(attributes))
+    year = _cert_year(facility)
+    if year:
+        facts.append(f"certified since {year}")
+    return _join_facts(opening, facts)
+
+
+# Historical only -- ltch is retired (seed.py), receives no rows going forward.
 def _ltch(facility: dict, attributes: dict) -> str:
     opening = _opening("ltch", facility)
     beds = attributes.get("total_beds")
@@ -161,9 +196,20 @@ def _ltch(facility: dict, attributes: dict) -> str:
 CONTENT_BUILDERS = {
     "nursing_home": _nursing_home,
     "home_health": _home_health,
-    "hospice": _thin_type("hospice"),
-    "irf": _thin_type("irf"),
+    "hospice": _generic("hospice"),
+    "irf": _generic("irf"),
     "ltch": _ltch,
+    "assisted_living": _generic("assisted_living"),
+    "icf_iid": _generic("icf_iid"),
+    "home_care": _generic("home_care"),
+    "adult_day_care": _generic("adult_day_care"),
+    "behavioral_health": _generic("behavioral_health"),
+    "outpatient_rehab": _generic("outpatient_rehab"),
+    "hospital": _generic("hospital"),
+    "dialysis_center": _generic("dialysis_center"),
+    "ambulatory_surgery_center": _generic("ambulatory_surgery_center"),
+    "nursing_staffing_agency": _nursing_staffing_agency,
+    "other_specialty": _generic("other_specialty"),
 }
 
 

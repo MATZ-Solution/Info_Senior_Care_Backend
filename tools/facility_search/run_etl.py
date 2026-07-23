@@ -1,7 +1,8 @@
 """
 Standalone CLI entrypoint for the facility ETL -- deliberately NOT wired into
-main.py's lifespan. ~35k rows across 5 tables is a manual/batch step, not
-something to re-run on every backend boot.
+main.py's lifespan. ~65k+ rows from All_State_Type_combined (Phase 11's single
+active source) is a manual/batch step, not something to re-run on every
+backend boot.
 
 Run: uv run python -m tools.facility_search.run_etl
 """

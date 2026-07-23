@@ -16,6 +16,7 @@ bytes in etl.py, corrupted-looking or not. Format-validating an identifier that'
 never displayed or queried was the direct cause of a real bug (real CMS CCNs are
 alphanumeric, e.g. "A01500", which a digits-only assumption rejected wholesale).
 """
+import json
 from datetime import date, datetime
 
 
@@ -48,6 +49,57 @@ def to_text(value) -> str | None:
 
 
 passthrough = to_text
+
+
+def title_case(value) -> str | None:
+    """
+    city/county casing normalizer -- Phase 11's combined source is not
+    guaranteed pre-cased like the 5 original CMS exports were. Consistent
+    casing matters downstream: known_values dedup (etl.py's
+    _refresh_known_values) and fuzzy_match.py's trigram lookups both key on
+    the literal stored string, so "Phoenix" and "PHOENIX" would otherwise
+    dedup and match as two different values.
+    """
+    if _blank(value):
+        return None
+    return str(value).strip().title()
+
+
+def upper_trim(value) -> str | None:
+    """
+    state casing normalizer -- fuzzy_match.py's STATE_ABBREVIATIONS/
+    _resolve_state_name assume the stored value is an uppercase 2-letter code
+    ("AZ"), matching the 5 original CMS tables' native format. Uppercasing
+    here keeps that assumption true regardless of the combined source's
+    actual casing.
+    """
+    if _blank(value):
+        return None
+    return str(value).strip().upper()
+
+
+def passthrough_json(value):
+    """
+    For source_extra -- an opaque catch-all JSON blob column. database.py's
+    asyncpg.create_pool has no `init=` callback registering a jsonb type
+    codec (confirmed by reading it directly), so a jsonb/json source column
+    comes back from asyncpg as a raw JSON *string*, not an already-decoded
+    dict/list -- confirmed, not assumed. Parsing it here is required: passing
+    the raw string straight through (deliberately NOT to_text either, which
+    would stringify a dict via repr() instead) would let etl.py's
+    _detail_params double-encode it later (a JSON string sitting inside the
+    JSON string) instead of storing a real nested object. Also accepts an
+    already-decoded dict/list unchanged, defensively, in case a codec is ever
+    added later.
+    """
+    if _blank(value):
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except (ValueError, TypeError):
+        raise ValueError(f"source_extra is not valid JSON: {value!r}")
 
 
 def to_int(value) -> int | None:
@@ -115,4 +167,7 @@ TRANSFORMS = {
     "to_float": to_float,
     "normalize_ownership": normalize_ownership,
     "parse_cms_date": parse_cms_date,
+    "title_case": title_case,
+    "upper_trim": upper_trim,
+    "passthrough_json": passthrough_json,
 }

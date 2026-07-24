@@ -1,27 +1,25 @@
 """
-Per-table field mappings for the 5 in-scope CMS source tables -- the Section 7
-human-reviewed judgment calls (Layer 1 vs. Layer 2 placement, embedding-worthiness)
-encoded as data. seed_mappings() loads these into infomary_source_field_mappings;
-etl.py only ever reads that table, never this module directly, so the config-vs-
-engine separation the docs call for is real.
+Phase 11 -- field mappings for All_State_Type_combined, the single active
+source going forward. The 5 original CMS tables (Hospice Providers,
+Informary_Inpatient Rehabilitation Facilities, Long_Term_hospitalcare, Home
+Health Agencies, Nursing Homes -- Provider Information) and their mapping
+rows are retired -- see the Phase 11 plan for the one-off
+`DELETE FROM infomary_source_field_mappings WHERE source_table IN (...)`
+cleanup for those 5 table names, run once at migration cutover. Nothing in
+this module references them anymore; the raw tables themselves stay
+untouched in Supabase as historical record, just unread.
 
-Source table names and column names below are copied verbatim from a live
-information_schema introspection, not retyped from memory -- several CMS column
-headers were truncated by Postgres's 63-byte identifier limit when these tables
-were first imported, so hand-transcribing them risks a silent off-by-a-few-bytes
-mismatch. The ~13 Home Health "how often patients..." outcome-rate columns hit
-this risk hardest (some end mid-word with an uncertain trailing space) and are
-therefore discovered live at seed time (_discover_home_health_outcomes) rather
-than hardcoded -- everything else here is short/complete and safe to hardcode.
+seed_mappings() loads COMBINED_MAPPINGS into infomary_source_field_mappings;
+etl.py only ever reads that table, never this module directly, so the
+config-vs-engine separation the docs call for is real.
+
+Column names/casing below are confirmed via a real information_schema
+introspection of All_State_Type_combined, not retyped from memory.
 """
 from database import get_db_connection
 from logger import log_db, log_success
 
-HOSPICE_TABLE = "Hospice Providers"
-IRF_TABLE = "Informary_Inpatient Rehabilitation Facilities"
-LTCH_TABLE = "Long_Term_hospitalcare"
-HOME_HEALTH_TABLE = "Home Health Agencies"
-NURSING_HOME_TABLE = "Nursing Homes — Provider Information"  # em dash (U+2014), confirmed live
+COMBINED_TABLE = "All_State_Type_combined"
 
 
 def _m(source_table, source_column, target_field, target_layer, transform_fn, facility_type, is_required=False):
@@ -36,161 +34,123 @@ def _m(source_table, source_column, target_field, target_layer, transform_fn, fa
     }
 
 
-def _identity_block(table, facility_type, ccn_col, name_col, addr1_col, addr2_col="Address Line 2",
-                     has_addr2=True, has_county=True, has_cms_region=True):
-    """The Layer-1 shape shared by Hospice/IRF/LTCH (and re-used partially by others)."""
-    rows = [
-        # CCN is NOT facility_id -- it's a plain, unvalidated audit column.
-        # facility_id is computed separately in etl.py (uuid5 of this value, or a
-        # fallback natural key if this is blank) -- see etl.py's _compute_facility_id.
-        _m(table, ccn_col, "source_identifier", "facilities", "to_text", facility_type),
-        _m(table, name_col, "name", "facilities", "to_text", facility_type, is_required=True),
-        _m(table, addr1_col, "address_line1", "facilities", "to_text", facility_type),
-        _m(table, "City/Town", "city", "facilities", "to_text", facility_type),
-        _m(table, "State", "state", "facilities", "to_text", facility_type),
-        _m(table, "ZIP Code", "zip_code", "facilities", "zero_pad_5", facility_type),
-        _m(table, "Telephone Number", "phone", "facilities", "to_text", facility_type),
-        _m(table, "Ownership Type", "ownership_type", "facilities", "normalize_ownership", facility_type),
-        _m(table, "Certification Date", "certification_date", "facilities", "parse_cms_date", facility_type),
-    ]
-    if has_addr2:
-        rows.append(_m(table, addr2_col, "address_line2", "facilities", "to_text", facility_type))
-    if has_county:
-        rows.append(_m(table, "County/Parish", "county", "facilities", "to_text", facility_type))
-    if has_cms_region:
-        rows.append(_m(table, "CMS Region", "cms_region", "facilities", "to_int", facility_type))
-    return rows
+def _c(source_column, target_field, target_layer, transform_fn, is_required=False):
+    return _m(COMBINED_TABLE, source_column, target_field, target_layer, transform_fn, None, is_required)
 
 
-HOSPICE_MAPPINGS = _identity_block(
-    HOSPICE_TABLE, "hospice", "CMS Certification Number (CCN)", "Facility Name", "Address Line 1",
-)
+# facility_type_category (exact live strings) -> type_key. This is what
+# etl.py's _process_combined_table uses to resolve each ROW's type -- the
+# combined table holds all 15 active types in one table, each row carrying
+# its own category, unlike the old design where type was fixed per whole
+# table.
+#
+# Per your decision: 15 of the 16 real categories are included; only Health
+# Maintenance Organization is excluded (not a physical care location). A
+# category present in the live data but absent from BOTH this dict AND
+# KNOWN_EXCLUDED_CATEGORIES is a genuine surprise (an unreviewed 17th
+# category) -- etl.py logs this distinctly from a normal, expected exclusion.
+FACILITY_TYPE_CATEGORY_RESOLUTION: dict[str, str] = {
+    "Nursing Home / Skilled Nursing Facility": "nursing_home",
+    "Home Health Agency": "home_health",
+    "Hospice": "hospice",
+    "Rehabilitation - Inpatient": "irf",
+    "Residential Care / Assisted Living": "assisted_living",
+    "Intermediate Care Facility (ICF/IID)": "icf_iid",
+    "Home Care Agency": "home_care",
+    "Adult Day Care": "adult_day_care",
+    "Mental/Behavioral Health Facility": "behavioral_health",
+    "Rehabilitation - Outpatient": "outpatient_rehab",
+    "Hospital": "hospital",
+    "Dialysis Center": "dialysis_center",
+    "Ambulatory Surgery Center": "ambulatory_surgery_center",
+    "Nursing Staffing Agency": "nursing_staffing_agency",
+    "Other/Unspecified/Specialty": "other_specialty",
+    # "Health Maintenance Organization" deliberately NOT mapped -- the one
+    # confirmed exclusion. Falls through to the "unresolved, skip+count"
+    # branch in etl.py's Pass 1, same mechanism as any genuinely unrecognized
+    # category, but tagged as an expected exclusion (see KNOWN_EXCLUDED_
+    # CATEGORIES below), not a surprise one.
+}
 
-IRF_MAPPINGS = _identity_block(
-    IRF_TABLE, "irf", "CMS Certification Number (CCN)", "Provider Name", "Address Line 1",
-)
-
-LTCH_MAPPINGS = _identity_block(
-    LTCH_TABLE, "ltch", "CMS Certification Number (CCN)", "Provider Name", "Address Line 1",
-) + [
-    _m(LTCH_TABLE, "Total Number of Beds", "total_beds", "facility_detail", "to_int", "ltch"),
-]
-
-# Home Health Agencies has a different shape: single "Address" column, no
-# County/CMS Region columns at all (those stay NULL for this type).
-HOME_HEALTH_STATIC_MAPPINGS = [
-    _m(HOME_HEALTH_TABLE, "CMS Certification Number (CCN)", "source_identifier", "facilities", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Provider Name", "name", "facilities", "to_text", "home_health", is_required=True),
-    _m(HOME_HEALTH_TABLE, "Address", "address_line1", "facilities", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "City/Town", "city", "facilities", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "State", "state", "facilities", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "ZIP Code", "zip_code", "facilities", "zero_pad_5", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Telephone Number", "phone", "facilities", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Type of Ownership", "ownership_type", "facilities", "normalize_ownership", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Certification Date", "certification_date", "facilities", "parse_cms_date", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Offers Nursing Care Services", "services.nursing", "facility_detail", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Offers Physical Therapy Services", "services.physical_therapy", "facility_detail", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Offers Occupational Therapy Services", "services.occupational_therapy", "facility_detail", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Offers Speech Pathology Services", "services.speech_pathology", "facility_detail", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Offers Medical Social Services", "services.medical_social", "facility_detail", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Offers Home Health Aide Services", "services.home_health_aide", "facility_detail", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "Quality of patient care star rating", "quality_star_rating", "facility_detail", "to_float", "home_health"),
-    _m(HOME_HEALTH_TABLE, "DTC Performance Categorization", "discharge_to_community_category", "facility_detail", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "PPR Performance Categorization", "readmission_category", "facility_detail", "to_text", "home_health"),
-    _m(HOME_HEALTH_TABLE, "PPH Performance Categorization", "preventable_hospitalization_category", "facility_detail", "to_text", "home_health"),
-]
-
-# Columns already covered above, or deliberately excluded (Numerator/Denominator/
-# Footnote noise, or the truncated/optional Medicare-spend-per-episode fields) --
-# used to compute what's left over for _discover_home_health_outcomes.
-_HOME_HEALTH_EXCLUDED_PREFIXES = ("Numerator for", "Denominator for", "Footnote")
-_HOME_HEALTH_ALREADY_MAPPED = {m["source_column"] for m in HOME_HEALTH_STATIC_MAPPINGS}
+KNOWN_EXCLUDED_CATEGORIES: frozenset[str] = frozenset({"Health Maintenance Organization"})
+KNOWN_CATEGORIES: frozenset[str] = frozenset(FACILITY_TYPE_CATEGORY_RESOLUTION.keys()) | KNOWN_EXCLUDED_CATEGORIES
 
 
-async def _discover_home_health_outcomes(conn):
-    """
-    The ~13 "How often patients got better at X" rate columns -- discovered live
-    (not hardcoded) because several of their exact names are truncated at
-    Postgres's 63-byte identifier limit with an uncertain trailing space, and a
-    mistyped source_column would silently fail to match any row data rather than
-    erroring loudly. Anything not already statically mapped and not matching the
-    Numerator/Denominator/Footnote noise prefixes is one of these outcome columns.
-    """
-    cols = await conn.fetch(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema='public' AND table_name = $1 ORDER BY ordinal_position",
-        HOME_HEALTH_TABLE,
-    )
-    rows = []
-    for c in cols:
-        name = c["column_name"]
-        if name in _HOME_HEALTH_ALREADY_MAPPED:
-            continue
-        if any(name.startswith(p) for p in _HOME_HEALTH_EXCLUDED_PREFIXES):
-            continue
-        if name in ("How much Medicare spends on an episode of care at this agency, ",):
-            continue
-        slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")
-        while "__" in slug:
-            slug = slug.replace("__", "_")
-        rows.append(_m(HOME_HEALTH_TABLE, name, f"outcomes.{slug[:40]}", "facility_detail", "to_text", "home_health"))
-    return rows
+COMBINED_MAPPINGS: list[dict] = [
+    # -----------------------------------------------------------------
+    # Layer 1 -- facilities (identity / filterable). facility_type is None
+    # for every row here -- this column is purely informational (never used
+    # to select mappings at query time, see etl.py's mapping SELECT), and
+    # DROP NOT NULL (schema.py) makes this legal.
+    # -----------------------------------------------------------------
+    _c("ccn", "source_identifier", "facilities", "to_text"),
+    _c("name", "name", "facilities", "to_text", is_required=True),
+    _c("legal_business_name", "legal_business_name", "facilities", "to_text"),
+    _c("ownership_type", "ownership_type", "facilities", "normalize_ownership"),
+    _c("address", "address_line1", "facilities", "to_text"),
+    _c("city", "city", "facilities", "title_case"),
+    _c("state", "state", "facilities", "upper_trim"),
+    _c("zip_code", "zip_code", "facilities", "zero_pad_5"),
+    _c("county", "county", "facilities", "title_case"),
+    _c("phone", "phone", "facilities", "to_text"),
+    _c("email", "email", "facilities", "to_text"),
+    _c("facility_subtype", "facility_subtype", "facilities", "to_text"),
+    _c("cms_region", "cms_region", "facilities", "to_int"),
+    _c("certification_date", "certification_date", "facilities", "parse_cms_date"),
+    _c("latitude", "latitude", "facilities", "to_float"),
+    _c("longitude", "longitude", "facilities", "to_float"),
 
+    # -----------------------------------------------------------------
+    # Layer 2 -- facility_detail.attributes -- shared across every type
+    # (schemas.py's _BASE_PROPERTIES: overall_rating/offers/source_extra)
+    # -----------------------------------------------------------------
+    _c("overall_rating", "overall_rating", "facility_detail", "to_float"),
+    _c("extra_attributes", "source_extra", "facility_detail", "passthrough_json"),
+    _c("offers_alzheimer_dementia_care", "offers.alzheimer_dementia_care", "facility_detail", "to_text"),
+    _c("offers_adult_day_care", "offers.adult_day_care", "facility_detail", "to_text"),
+    _c("offers_respite_care", "offers.respite_care", "facility_detail", "to_text"),
+    _c("offers_home_care_services", "offers.home_care_services", "facility_detail", "to_text"),
+    _c("offers_iv_therapy", "offers.iv_therapy", "facility_detail", "to_text"),
+    _c("offers_pain_management", "offers.pain_management", "facility_detail", "to_text"),
+    _c("offers_medical_equipment_supply", "offers.medical_equipment_supply", "facility_detail", "to_text"),
 
-NURSING_HOME_MAPPINGS = [
-    _m(NURSING_HOME_TABLE, "CMS Certification Number (CCN)", "source_identifier", "facilities", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Provider Name", "name", "facilities", "to_text", "nursing_home", is_required=True),
-    _m(NURSING_HOME_TABLE, "Provider Address", "address_line1", "facilities", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "City/Town", "city", "facilities", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "State", "state", "facilities", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "ZIP Code", "zip_code", "facilities", "zero_pad_5", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "County/Parish", "county", "facilities", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Telephone Number", "phone", "facilities", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Ownership Type", "ownership_type", "facilities", "normalize_ownership", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Date First Approved to Provide Medicare and Medicaid Services", "certification_date", "facilities", "parse_cms_date", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Latitude", "latitude", "facilities", "to_float", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Longitude", "longitude", "facilities", "to_float", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Provider Type", "provider_type", "facility_detail", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Number of Certified Beds", "certified_beds", "facility_detail", "to_int", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Average Number of Residents per Day", "avg_residents_per_day", "facility_detail", "to_float", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Overall Rating", "ratings.overall", "facility_detail", "to_int", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Health Inspection Rating", "ratings.health_inspection", "facility_detail", "to_int", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Staffing Rating", "ratings.staffing", "facility_detail", "to_int", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "QM Rating", "ratings.qm", "facility_detail", "to_int", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Special Focus Status", "special_focus_status", "facility_detail", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Abuse Icon", "abuse_icon", "facility_detail", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Continuing Care Retirement Community", "ccrc", "facility_detail", "to_text", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Reported RN Staffing Hours per Resident per Day", "staffing_hours.rn", "facility_detail", "to_float", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Reported LPN Staffing Hours per Resident per Day", "staffing_hours.lpn", "facility_detail", "to_float", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Reported Nurse Aide Staffing Hours per Resident per Day", "staffing_hours.nurse_aide", "facility_detail", "to_float", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Total Number of Penalties", "total_penalties", "facility_detail", "to_int", "nursing_home"),
-    _m(NURSING_HOME_TABLE, "Number of Fines", "number_of_fines", "facility_detail", "to_int", "nursing_home"),
+    # -----------------------------------------------------------------
+    # Layer 2 -- nursing_home-specific (blank/None for non-nursing-home
+    # rows; to_int/to_text/to_float already return None on blank input,
+    # so this is safe to map unconditionally for every row)
+    # -----------------------------------------------------------------
+    _c("nh_total_certified_beds", "total_certified_beds", "facility_detail", "to_int"),
+    _c("nh_chain_affiliation", "chain_affiliation", "facility_detail", "to_text"),
+    _c("nh_health_inspection_star_rating", "health_inspection_rating", "facility_detail", "to_float"),
+    _c("nh_staffing_star_rating", "staffing_rating", "facility_detail", "to_float"),
+    _c("nh_quality_measure_star_rating", "quality_measure_rating", "facility_detail", "to_float"),
+    _c("nh_staffing_level_assessment", "staffing_level_assessment", "facility_detail", "to_text"),
+
+    # -----------------------------------------------------------------
+    # Layer 2 -- home_health-specific
+    # -----------------------------------------------------------------
+    _c("hh_provides_nursing_care", "offers_nursing_care", "facility_detail", "to_text"),
+    _c("hh_provides_physical_therapy", "offers_physical_therapy", "facility_detail", "to_text"),
+    _c("hh_provides_occupational_therapy", "offers_occupational_therapy", "facility_detail", "to_text"),
+    _c("hh_provides_speech_therapy", "offers_speech_therapy", "facility_detail", "to_text"),
+    _c("hh_provides_medical_social_services", "offers_medical_social_services", "facility_detail", "to_text"),
+    _c("hh_provides_home_health_aides", "offers_home_health_aides", "facility_detail", "to_text"),
+    _c("hh_home_discharge_success", "home_discharge_success", "facility_detail", "to_float"),
 ]
 
 
 async def seed_mappings():
     """
-    Replaces (not merely appends) each in-scope source_table's mapping rows.
-    Append-only seeding would leave stale rows behind whenever a mapping in this
-    module changes shape -- e.g. when CCN's target moved from facility_id to
-    source_identifier, an append-only seed would have left the old facility_id
-    row in place alongside the new one, and etl.py would have tried to populate
-    facility_id from both.
+    Replaces (not merely appends) source_table's mapping rows. Append-only
+    seeding would leave stale rows behind whenever a mapping in this module
+    changes shape.
     """
     log_db("Seeding source_field_mappings...")
     async with get_db_connection() as conn:
-        home_health_outcomes = await _discover_home_health_outcomes(conn)
-        all_rows = (
-            HOSPICE_MAPPINGS + IRF_MAPPINGS + LTCH_MAPPINGS
-            + HOME_HEALTH_STATIC_MAPPINGS + home_health_outcomes
-            + NURSING_HOME_MAPPINGS
+        await conn.execute(
+            "DELETE FROM infomary_source_field_mappings WHERE source_table = $1", COMBINED_TABLE,
         )
-        source_tables = {m["source_table"] for m in all_rows}
-        for source_table in source_tables:
-            await conn.execute(
-                "DELETE FROM infomary_source_field_mappings WHERE source_table = $1", source_table,
-            )
-        for m in all_rows:
+        for m in COMBINED_MAPPINGS:
             await conn.execute(
                 "INSERT INTO infomary_source_field_mappings "
                 "(source_table, source_column, target_field, target_layer, transform_fn, is_required, facility_type) "
@@ -198,5 +158,4 @@ async def seed_mappings():
                 m["source_table"], m["source_column"], m["target_field"], m["target_layer"],
                 m["transform_fn"], m["is_required"], m["facility_type"],
             )
-        log_success(f"source_field_mappings seeded ({len(all_rows)} rows, "
-                    f"{len(home_health_outcomes)} home_health outcome columns discovered live)")
+        log_success(f"source_field_mappings seeded ({len(COMBINED_MAPPINGS)} rows for {COMBINED_TABLE})")

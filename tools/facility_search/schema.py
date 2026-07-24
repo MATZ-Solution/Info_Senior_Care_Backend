@@ -60,10 +60,19 @@ async def create_tables():
                 target_layer TEXT NOT NULL CHECK (target_layer IN ('facilities', 'facility_detail')),
                 transform_fn TEXT,
                 is_required BOOLEAN NOT NULL DEFAULT FALSE,
-                facility_type TEXT NOT NULL REFERENCES infomary_facility_types(type_key),
+                facility_type TEXT REFERENCES infomary_facility_types(type_key),
                 UNIQUE (source_table, source_column, target_field)
             )
         """)
+        # Phase 11 -- facility_type was NOT NULL when each source_table mapped to
+        # exactly one type. All_State_Type_combined holds all 15 types in one table,
+        # resolved per ROW from facility_type_category, not per mapping row -- so its
+        # mapping rows carry facility_type=NULL (this column was already unused for
+        # filtering in etl.py's mapping SELECT, so relaxing it is safe for the 5
+        # single-type tables' existing rows too).
+        await conn.execute(
+            "ALTER TABLE infomary_source_field_mappings ALTER COLUMN facility_type DROP NOT NULL"
+        )
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS infomary_facilities (
@@ -89,6 +98,14 @@ async def create_tables():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # Phase 11 -- All_State_Type_combined carries 3 identity/display fields the
+        # 5 original CMS tables never had. Added via ALTER, not baked into the
+        # CREATE TABLE above, since that statement is IF NOT EXISTS and won't run
+        # again on an already-existing table.
+        await conn.execute("ALTER TABLE infomary_facilities ADD COLUMN IF NOT EXISTS legal_business_name TEXT")
+        await conn.execute("ALTER TABLE infomary_facilities ADD COLUMN IF NOT EXISTS email TEXT")
+        await conn.execute("ALTER TABLE infomary_facilities ADD COLUMN IF NOT EXISTS facility_subtype TEXT")
+
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_facilities_type ON infomary_facilities (facility_type)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_facilities_state ON infomary_facilities (state)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_facilities_city ON infomary_facilities (city)")

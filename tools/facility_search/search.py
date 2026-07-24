@@ -189,6 +189,20 @@ async def _supabase_filtered_query(conn, filters: dict) -> list:
     return [dict(r) for r in rows]
 
 
+# Phase 11 -- nursing_staffing_agency is a B2B vendor supplying nurses TO
+# facilities, not a residence or direct-care location. content_templates.py's
+# builder for this type already says so, but that text ONLY ever feeds the
+# Qdrant embedding corpus (embed_sync.py) -- it's never read by search.py, so
+# it never actually reached a real card or reply. Stated here too, in what
+# _row_to_card/_intro_text actually return, so it can't be silently dropped
+# by the LLM's own paraphrase (same reasoning as Phase 10's DISCLOSURE_PREFIX
+# server-side enforcement, applied at the source instead of retrofitted).
+_STAFFING_AGENCY_NOTE = (
+    "This is a staffing agency that supplies nursing staff to facilities -- "
+    "not a residence or direct-care location."
+)
+
+
 def _highlight(facility_type: str, attributes: dict) -> str | None:
     if facility_type == "nursing_home":
         rating = (attributes.get("ratings") or {}).get("overall")
@@ -226,6 +240,7 @@ def _row_to_card(row: dict, facility_type: str) -> dict:
         "state": row.get("state"),
         "phone": row.get("phone"),
         "highlight": _highlight(facility_type, attributes or {}),
+        "note": _STAFFING_AGENCY_NOTE if facility_type == "nursing_staffing_agency" else None,
     }
 
 
@@ -274,6 +289,8 @@ def _intro_text(rows: list, filters: dict, low_confidence: bool) -> str:
         text += (" (Matched on facility type/location -- the descriptive part of your request didn't "
                  "have a strong enough match to rank by, so this isn't ordered by how well it fits that "
                  "description.)")
+    if filters.get("facility_type") == "nursing_staffing_agency":
+        text += f" Note: {_STAFFING_AGENCY_NOTE}"
     return text
 
 

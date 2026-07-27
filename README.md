@@ -568,6 +568,8 @@ this consistently before launch -- flagging rather than silently
 normalizing it for you.
 
 ---
+# running cammand 
+uvicorn app.main:app --host 0.0.0.0 --reload
 
 ## Scaling notes for 10k concurrent users (not yet load-tested)
 

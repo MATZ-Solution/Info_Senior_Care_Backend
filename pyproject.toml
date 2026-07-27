@@ -19,6 +19,7 @@ dependencies = [
     "langchain-cerebras>=0.8.2",
     "langchain-core>=0.3.75",
     "langchain-groq>=0.3.0",
+    "typesense>=1.1.1",
     "loguru>=0.7.3",
     "orjson==3.10.7",
     "passlib[bcrypt]==1.7.4",

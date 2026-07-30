@@ -72,23 +72,6 @@
 # settings = get_settings()
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # """
 # Centralized application configuration.
 
@@ -224,17 +207,6 @@
 # settings = get_settings()
 
 
-
-
-
-
-
-
-
-
-
-
-
 """
 Centralized application configuration.
 
@@ -242,11 +214,19 @@ All environment-dependent values are loaded here ONCE and reused everywhere.
 Never read os.environ directly elsewhere in the codebase — always import
 `settings` from this module. This keeps config validated, typed, and testable.
 """
+
 from functools import lru_cache
 from typing import List
+import os
+from dotenv import load_dotenv
 
+# Load environment variables from .env file
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+load_dotenv(override=True)  # Load environment variables from .env file
+
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", ["http://localhost:8081"])
 
 
 class Settings(BaseSettings):
@@ -347,9 +327,7 @@ class Settings(BaseSettings):
     def validate_typesense_protocol(cls, v: str) -> str:
         normalized = v.strip().lower()
         if normalized not in {"http", "https"}:
-            raise ValueError(
-                f"TYPESENSE_PROTOCOL must be 'http' or 'https', got {v!r}"
-            )
+            raise ValueError(f"TYPESENSE_PROTOCOL must be 'http' or 'https', got {v!r}")
         return normalized
 
     @field_validator("TYPESENSE_HOST")

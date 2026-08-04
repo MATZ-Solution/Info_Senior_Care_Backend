@@ -1,32 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # """Facility response/request schemas."""
 # from typing import Optional
 
@@ -128,6 +100,9 @@
 #     email: Optional[str] = None
 #     operating_status: Optional[str] = None
 #     data_source: Optional[str] = None
+#     certification_date: Optional[str] = None
+#     secure_memory_care_beds: Optional[int] = None
+#     specialty_notes: Optional[str] = None
 
 #     nursing_home_detail: Optional[NursingHomeDetailOut] = None
 #     home_health_detail: Optional[HomeHealthDetailOut] = None
@@ -146,43 +121,6 @@
 #     radius_miles: Optional[float] = Field(default=None, gt=0, le=500)
 #     page: int = Field(default=1, ge=1)
 #     page_size: int = Field(default=20, ge=1, le=100)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -243,8 +181,10 @@ class FacilitySuggestItem(UUIDStrMixin):
 
     id: str
     name: str
+    address: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None
+    zip_code: Optional[str] = None
 
 
 class PaginatedFacilities(BaseModel):

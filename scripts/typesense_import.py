@@ -297,7 +297,7 @@ def _configure_logging(verbose: bool) -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sync public.\"All_State_Type_combined\" into TypeSense.",
+        description="Sync public.\"Final Table\" into TypeSense.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mode = parser.add_mutually_exclusive_group(required=True)

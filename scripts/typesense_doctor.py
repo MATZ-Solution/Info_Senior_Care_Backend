@@ -1929,7 +1929,7 @@ def check_modules() -> bool:
         sql = build_select_sql()
         assert "OFFSET" not in sql.upper(), "still using OFFSET pagination"
         assert ":after_uuid" in sql and ":since" in sql, "keyset/incremental params missing"
-        assert 'public."All_State_Type_combined"' in sql, "source table not quoted correctly"
+        assert 'public."Final Table"' in sql, "source table not quoted correctly"
         return "coercion, null handling and keyset SQL all correct"
 
     probe("app.utils.facility_mapper", _mapper)
@@ -2171,7 +2171,7 @@ async def check_source_table() -> bool:
             result = await session.execute(
                 text(
                     "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'All_State_Type_combined'"
+                    "WHERE table_schema = 'public' AND table_name = 'Final Table'"
                 )
             )
             available = {row[0] for row in result.all()}
@@ -2194,14 +2194,14 @@ async def check_source_table() -> bool:
             ok(f"all {len(SOURCE_COLUMNS)} mapped columns present")
 
             count = (
-                await session.execute(text('SELECT COUNT(*) FROM public."All_State_Type_combined"'))
+                await session.execute(text('SELECT COUNT(*) FROM public."Final Table"'))
             ).scalar_one()
             ok(f"{count:,} rows")
 
             nulls = (
                 await session.execute(
                     text(
-                        'SELECT COUNT(*) FROM public."All_State_Type_combined" '
+                        'SELECT COUNT(*) FROM public."Final Table" '
                         'WHERE "updated_at" IS NULL'
                     )
                 )

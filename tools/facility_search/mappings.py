@@ -1,5 +1,5 @@
 """
-Phase 11 -- field mappings for All_State_Type_combined, the single active
+Phase 11 -- field mappings for Final Table, the single active
 source going forward. The 5 original CMS tables (Hospice Providers,
 Informary_Inpatient Rehabilitation Facilities, Long_Term_hospitalcare, Home
 Health Agencies, Nursing Homes -- Provider Information) and their mapping
@@ -14,12 +14,12 @@ etl.py only ever reads that table, never this module directly, so the
 config-vs-engine separation the docs call for is real.
 
 Column names/casing below are confirmed via a real information_schema
-introspection of All_State_Type_combined, not retyped from memory.
+introspection of Final Table, not retyped from memory.
 """
 from database import get_db_connection
 from logger import log_db, log_success
 
-COMBINED_TABLE = "All_State_Type_combined"
+COMBINED_TABLE = "Final Table"
 
 
 def _m(source_table, source_column, target_field, target_layer, transform_fn, facility_type, is_required=False):

@@ -1,7 +1,7 @@
 """
 Postgres -> TypeSense synchronisation.
 
-`public."All_State_Type_combined"` is the source of truth. This module only
+`public."Final Table"` is the source of truth. This module only
 ever reads from it and writes to TypeSense; it never writes to Postgres.
 
 THREE MODES, THREE DIFFERENT PROBLEMS

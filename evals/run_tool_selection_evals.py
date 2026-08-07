@@ -28,7 +28,7 @@ from evals.langsmith_utils import sync_dataset
 
 from evals.dataset import EvalCase, TOOL_SELECTION_CASES
 from system_prompt.instructions import system_instructions
-from tools.agent_tools import facility_search, google_search, save_lead
+from tools.agent_tools import facility_search, google_search
 
 load_dotenv()
 
@@ -38,12 +38,9 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
     model="llama-3.3-70b-versatile",
     temperature=0.1,
-).bind_tools([google_search, save_lead, facility_search])
+).bind_tools([google_search, facility_search])
 
-_EVAL_SESSION_SUFFIX = (
-    "\n\nYour session_id for this conversation is: eval-session\n"
-    "You MUST pass this exact session_id in every single save_lead tool call."
-)
+_EVAL_SESSION_SUFFIX = "\n\nYour session_id for this conversation is: eval-session"
 
 
 def _build_messages(history: list[dict], message: str) -> list:
@@ -71,8 +68,8 @@ def tool_call_evaluator(run: Run, example: Example) -> dict:
     actual_names = [tc["name"] for tc in actual_tool_calls]
 
     if expected_tool is None:
-        # Soft cases (refusals/off-topic/emergency-adjacent): only the
-        # search tools matter here -- a save_lead call alongside is fine.
+        # Soft cases (refusals/off-topic/emergency-adjacent): should call
+        # neither search tool at all.
         called_search = any(name in ("facility_search", "google_search") for name in actual_names)
         return {
             "key": "tool_correct",

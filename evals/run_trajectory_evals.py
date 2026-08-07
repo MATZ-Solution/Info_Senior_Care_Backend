@@ -27,13 +27,6 @@ from evals.run_tool_selection_evals import _build_messages, llm
 from tools.agent_tools import facility_search, google_search
 from tools.facility_search.search import DISCLOSURE_PREFIX
 
-# save_lead is deliberately NOT imported/invoked for real here -- these cases
-# don't test lead-capture behavior, and the real tool writes to live
-# Supabase/Google Sheets/email. A stubbed result (matching the real tool's
-# return shape, "Lead saved. ID: ...") keeps the conversation loop's
-# downstream reasoning intact without touching real data.
-_STUBBED_SAVE_LEAD_RESULT = "Lead saved. ID: EVAL-STUB"
-
 load_dotenv()
 
 
@@ -58,7 +51,18 @@ async def _run_agent_turn(messages: list) -> tuple[str, list[str], list[dict], l
     disclosure_required = False
     response = None
     for _ in range(5):
-        response = await llm.ainvoke(messages)
+        try:
+            response = await llm.ainvoke(messages)
+        except Exception as e:
+            # Mirrors main.py's run_turn retry -- Groq occasionally emits a
+            # malformed function-call payload; one retry clears it in
+            # production, so an eval run shouldn't hard-fail on the same
+            # transient error and lose the whole example's score.
+            err_text = str(e).lower()
+            if "tool call validation failed" in err_text or "tool_use_failed" in err_text:
+                response = await llm.ainvoke(messages)
+            else:
+                raise
         if getattr(response, "tool_calls", None):
             messages.append(response)
             for tc in response.tool_calls:
@@ -67,8 +71,6 @@ async def _run_agent_turn(messages: list) -> tuple[str, list[str], list[dict], l
                 if tc["name"] == "google_search":
                     tool_message = await google_search.ainvoke(tc)
                     result = tool_message.content
-                elif tc["name"] == "save_lead":
-                    result = _STUBBED_SAVE_LEAD_RESULT
                 elif tc["name"] == "facility_search":
                     tool_message = await facility_search.ainvoke(tc)
                     result = tool_message.content
@@ -153,7 +155,7 @@ def trajectory_evaluator(run: Run, example: Example) -> dict:
             }
 
     case_id = example.metadata.get("case_id", "")
-    if case_id == "trajectory_empty_facility_search_fallback":
+    if case_id == "tj_retired_ltch_type":
         if "cms-certified" not in final_text and "certified" not in final_text:
             return {
                 "key": "trajectory_correct",
@@ -175,11 +177,10 @@ async def main():
         description="Tier 2 multi-step trajectory cases (backend/evals/dataset.py TRAJECTORY_CASES).",
     )
 
-    # facility_search has no self-healing DB pool init (unlike save_lead's
-    # _persist_lead, which lazily calls init_db_pool() itself) -- in the real
-    # app this is a non-issue since main.py's lifespan initializes the pool
-    # once at server startup before any request arrives. This script has no
-    # such startup hook, so it must be done explicitly here, or a cold-start
+    # facility_search has no self-healing DB pool init -- in the real app
+    # this is a non-issue since main.py's lifespan initializes the pool once
+    # at server startup before any request arrives. This script has no such
+    # startup hook, so it must be done explicitly here, or a cold-start
     # facility_search call fails with "DB pool not initialized" and the
     # eval would score a false pass/fail for the wrong reason.
     await init_db_pool()

@@ -720,19 +720,49 @@ _STAFFING_AGENCY_NOTE = (
 )
 
 
-def _highlight(facility_type: str, attributes: dict) -> str | None:
-    if facility_type == "nursing_home":
-        rating = (attributes.get("ratings") or {}).get("overall")
-        if rating is not None:
-            return f"overall rating {rating}/5"
-    elif facility_type == "home_health":
-        rating = attributes.get("quality_star_rating")
-        if rating is not None:
-            return f"quality rating {rating}/5"
-    elif facility_type == "ltch":
-        beds = attributes.get("total_beds")
-        if beds is not None:
-            return f"{beds} total beds"
+def _title_case_label(facility_type: str) -> str:
+    """
+    Card-facing display label, e.g. "Nursing Home", "Home Health Agency".
+
+    str.title() would mangle the hyphenated labels ("long-term care hospital"
+    -> "Long-Term Care Hospital" is fine, but it also uppercases after any
+    apostrophe), so capitalize word-by-word on spaces only and leave the rest
+    of each word untouched.
+    """
+    label = TYPE_LABELS.get(facility_type, facility_type)
+    return " ".join(w[:1].upper() + w[1:] for w in label.split(" "))
+
+
+def _highlight(attributes: dict) -> str | None:
+    """
+    Short badge text for the card, read from the attributes JSONB.
+
+    No longer takes facility_type: overall_rating is a shared base attribute
+    written for every type (schemas.py's _BASE_PROPERTIES), so the same key
+    works everywhere and the per-type branching this used to do was what hid
+    the broken key paths described below.
+
+    The key paths here are the ones the ETL actually writes (see mappings.py's
+    COMBINED_MAPPINGS + schemas.py) -- previously this read "ratings"."overall"
+    and "quality_star_rating", neither of which exists anywhere in the stored
+    JSONB, so every card came back with highlight=null. Verified against live
+    data: overall_rating is populated for 13,776 nursing homes and 6,687 home
+    health agencies, and is the ONLY rating either type carries (no separate
+    home-health quality field exists).
+
+    The 5-point CMS scale is 1-5, but 125 rows carry a 9.0 -- a source
+    sentinel for "not available", not a real 9-star rating. Rendering that
+    verbatim would show "9/5" on a card, so anything outside 1-5 is dropped.
+
+    The ltch branch is gone: that type is retired (seed.py) and receives zero
+    rows, and "total_beds" was never a key the combined-source ETL wrote --
+    nursing homes store bed counts under "total_certified_beds".
+    """
+    rating = attributes.get("overall_rating")
+    if isinstance(rating, (int, float)) and 1 <= rating <= 5:
+        # Ratings are stored as floats (1.0, 2.0, ...) but are whole numbers on
+        # a 1-5 scale -- render "4/5", not "4.0/5".
+        return f"{rating:g}/5 CMS rating"
     return None
 
 
@@ -762,11 +792,19 @@ def _row_to_card(row: dict, facility_type: str) -> dict:
         "id": str(row["facility_id"]),
         "source": "cms_certified",
         "name": row["name"],
-        "facility_type_label": TYPE_LABELS.get(facility_type, facility_type),
+        # TYPE_LABELS is deliberately lowercase -- it's built for mid-sentence
+        # prose ("I found 5 matching nursing home options", "A for-profit
+        # nursing home..."). Title-case it HERE rather than at the source, so
+        # the card matches the documented API contract without changing the
+        # wording of every sentence that shares the same dict.
+        "facility_type_label": _title_case_label(facility_type),
+        "address_line1": row.get("address_line1"),
         "city": row.get("city"),
         "state": row.get("state"),
+        "zip_code": row.get("zip_code"),
         "phone": row.get("phone"),
-        "highlight": _highlight(facility_type, attributes or {}),
+        "ownership_type": row.get("ownership_type"),
+        "highlight": _highlight(attributes or {}),
         "note": _STAFFING_AGENCY_NOTE if facility_type == "nursing_staffing_agency" else None,
     }
 

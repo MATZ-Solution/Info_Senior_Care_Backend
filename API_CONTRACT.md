@@ -452,13 +452,22 @@ No special-casing is needed for these beyond displaying them as a normal assista
 interface ChatFacilityCard {
   source: 'cms_certified' | 'not_certified'
 
-  // present only when source === 'cms_certified'
-  name?: string                  // facility name
-  facility_type_label?: string   // e.g. "Nursing Home", "Home Health Agency", "Hospice"
-  city?: string
-  state?: string
-  phone?: string
-  highlight?: string             // short badge text, e.g. a quality-rating callout — may be absent
+  // present only when source === 'cms_certified'.
+  // Every key below is ALWAYS present on a certified card — a missing value
+  // is `null`, never an omitted key. So `card.phone === null` is the check,
+  // not `'phone' in card`. (On a not_certified card these keys don't exist
+  // at all, hence the `?` — check `source` first.)
+  id?: string                    // pass to GET /facilities/{id} for the detail screen (Part 3)
+  name?: string                  // facility name — comes through ALL-CAPS from CMS, title-case it client-side
+  facility_type_label?: string   // e.g. "Nursing Home", "Home Health Agency", "Hospice Provider"
+  address_line1?: string | null  // street address
+  city?: string | null
+  state?: string | null
+  zip_code?: string | null
+  phone?: string | null          // NOT normalized — may be "(512) 372-4194" or "5123355028"
+  ownership_type?: string | null // "for_profit" | "nonprofit" | "government" | "unknown" — see note below
+  highlight?: string | null      // badge text, e.g. "4/5 CMS rating". Null unless the facility has a CMS star rating (nursing homes + home health agencies only — hospice/assisted living/etc. never do)
+  note?: string | null           // rare advisory that MUST be shown when non-null (see 12.3.4)
 
   // present only when source === 'not_certified' (general web search fallback)
   title?: string
@@ -467,18 +476,28 @@ interface ChatFacilityCard {
 }
 ```
 
+**Two values that are present but meaningless — treat as missing:**
+
+- `ownership_type` is the literal string `"unknown"` on many rows, not `null`. Guard both: `o && o !== 'unknown'`.
+- `phone` is inconsistently formatted in the source data; format client-side if you need it uniform.
+
 ### 12.2 Example payloads
 
-CMS-certified result:
+CMS-certified result (a real response — note `highlight`/`note` are `null`, not omitted):
 ```json
 {
+  "id": "a925a22b-866e-4968-9f68-ecd9abefda3c",
   "source": "cms_certified",
-  "name": "Golden Years Nursing Home",
-  "facility_type_label": "Nursing Home",
+  "name": "ACCENTCARE HOSPICE & PALLIATIVE CARE - AUSTIN",
+  "facility_type_label": "Hospice Provider",
+  "address_line1": "3520 EXECUTIVE CENTER DR STE 320",
   "city": "Austin",
   "state": "TX",
-  "phone": "(512) 555-0182",
-  "highlight": "5-star CMS rating"
+  "zip_code": "78731",
+  "phone": "(512) 372-4194",
+  "ownership_type": "for_profit",
+  "highlight": null,
+  "note": null
 }
 ```
 
@@ -495,7 +514,9 @@ Web-fallback result (no certified match found):
 ### 12.3 Rendering rules
 
 1. **One card row per assistant message that has cards**, positioned directly below that message's chat bubble — not a global/floating list.
-2. **`cms_certified` cards** get a visually distinct "certified" treatment (e.g. green accent, a certified badge/stamp icon) — show `name`, `facility_type_label`, `city`/`state` joined with a comma, `phone` if present, and `highlight` as a small pill/badge if present.
+2. **`cms_certified` cards** get a visually distinct "certified" treatment (e.g. green accent, a certified badge/stamp icon) — show `name`, `facility_type_label`, `city`/`state` joined with a comma, `phone` if present, and `highlight` as a small pill/badge if present. `address_line1`, `zip_code` and `ownership_type` are also available for a fuller address line or a details panel; each can be null, so render them conditionally rather than assuming they're set.
+   - **Details button** — pass `card.id` to `GET /api/v1/facilities/{id}` (Part 3) to open the detail screen. Use this id verbatim; do NOT re-look-up the facility by name/city, which is what causes the wrong facility's details to load. `not_certified` cards have no `id` and get no Details button — link out to `url` instead.
+   - **`note`** — when non-null, it MUST be displayed on the card. It carries an advisory the user needs in order to read the result correctly (e.g. a nursing staffing agency supplies staff to facilities and is not a residence or care location). It is null on the vast majority of cards.
 3. **`not_certified` cards** get a visually distinct "not certified" treatment (e.g. orange accent) with an explicit label like "Not CMS-certified — from general web search" — show `title` (as a link to `url` if present, else plain text) and `snippet` if present.
 4. **Multiple cards**: render as a swipeable/paginated row (prev/next controls + "`n / total`" indicator), not a long vertical list — a turn can return several cards.
 

@@ -104,26 +104,73 @@ async def create_tables():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_created ON infomary_leads(created_at DESC)")
         log_success("Tables created/verified!")
 
-async def save_message(session_id: str, role: str, content: str, facility_cards: list | None = None):
+class SessionAccessDenied(Exception):
+    """Raised when session_id exists and is owned by a different user_id."""
+    pass
+
+
+async def ensure_session_access(session_id: str, user_id: str | None, create: bool = False) -> None:
+    """
+    Raises SessionAccessDenied if session_id belongs to a different user_id.
+    If create=True, creates the session (owned by user_id) when it doesn't
+    exist yet. owner is None for BOTH "doesn't exist" and "exists but
+    anonymous" -- both are legitimately allowed (nothing to protect / the
+    existing public-by-UUID behavior for anonymous chats, unchanged).
+    """
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            # One transaction so the INSERT and SELECT run against the same
+            # connection/snapshot -- cheap insurance against pooling edge
+            # cases (ON CONFLICT DO NOTHING already self-resolves the
+            # concurrent-first-write race correctly on its own).
+            if create:
+                await conn.execute(
+                    "INSERT INTO infomary_sessions (session_id, user_id) VALUES ($1,$2) "
+                    "ON CONFLICT (session_id) DO NOTHING",
+                    session_id, user_id,
+                )
+            owner = await conn.fetchval(
+                "SELECT user_id FROM infomary_sessions WHERE session_id=$1", session_id
+            )
+        if owner is not None and owner != user_id:
+            raise SessionAccessDenied()
+
+
+async def claim_session_if_anonymous(session_id: str, user_id: str) -> None:
+    """
+    One-time adoption of a currently-unowned session by a real signed-in
+    user (e.g. they chatted anonymously, then logged in and reconnected to
+    the same session_id). The `user_id IS NULL` guard makes this safe to
+    call unconditionally -- it can only adopt an unowned session, never
+    take one that's already someone else's.
+    """
+    async with get_db_connection() as conn:
+        await conn.execute(
+            "UPDATE infomary_sessions SET user_id=$1 WHERE session_id=$2 AND user_id IS NULL",
+            user_id, session_id,
+        )
+
+
+async def save_message(session_id: str, role: str, content: str, facility_cards: list | None = None, user_id: str | None = None):
     import uuid
     try:
+        await ensure_session_access(session_id, user_id, create=True)
         async with get_db_connection() as conn:
-            await conn.execute(
-                "INSERT INTO infomary_sessions (session_id) VALUES ($1) ON CONFLICT DO NOTHING",
-                session_id
-            )
             await conn.execute(
                 "INSERT INTO infomary_messages (message_id, session_id, role, content, facility_cards) "
                 "VALUES ($1, $2, $3, $4, $5::jsonb)",
                 str(uuid.uuid4()), session_id, role, content,
                 json.dumps(facility_cards) if facility_cards is not None else None
             )
+    except SessionAccessDenied:
+        raise
     except Exception as e:
         log_error(f"save_message failed | session={session_id[:12]} | role={role} | {e}")
         raise
 
-async def fetch_history(session_id: str):
+async def fetch_history(session_id: str, requester_user_id: str | None = None):
     try:
+        await ensure_session_access(session_id, requester_user_id, create=False)
         async with get_db_connection() as conn:
             rows = await conn.fetch(
                 "SELECT role, content, facility_cards FROM infomary_messages WHERE session_id = $1 ORDER BY created_at ASC",
@@ -137,35 +184,48 @@ async def fetch_history(session_id: str):
                 }
                 for r in rows
             ]
+    except SessionAccessDenied:
+        raise
     except Exception as e:
         log_error(f"fetch_history failed | session={session_id[:12]} | {e}")
         return []
 
-async def update_session_title(session_id: str, title: str, description: str = ""):
+async def update_session_title(session_id: str, title: str, description: str = "", requester_user_id: str | None = None):
     try:
+        await ensure_session_access(session_id, requester_user_id, create=False)
         async with get_db_connection() as conn:
             await conn.execute(
                 "UPDATE infomary_sessions SET title = $1, description = $2 WHERE session_id = $3",
                 title, description, session_id
             )
+    except SessionAccessDenied:
+        raise
     except Exception as e:
         log_error(f"update_session_title failed | session={session_id[:12]} | {e}")
 
-async def get_all_sessions():
+async def get_all_sessions(user_id: str | None = None):
+    if user_id is None:
+        # No identified caller -- don't leak every session in the DB.
+        return []
     try:
         async with get_db_connection() as conn:
             rows = await conn.fetch(
-                "SELECT session_id, title, description, created_at FROM infomary_sessions ORDER BY created_at DESC"
+                "SELECT session_id, title, description, created_at FROM infomary_sessions "
+                "WHERE user_id = $1 ORDER BY created_at DESC",
+                user_id
             )
             return [{"session_id": r["session_id"], "title": r["title"], "description": r["description"], "created_at": str(r["created_at"])} for r in rows]
     except Exception as e:
         log_error(f"get_all_sessions failed | {e}")
         return []
 
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, requester_user_id: str | None = None):
     try:
+        await ensure_session_access(session_id, requester_user_id, create=False)
         async with get_db_connection() as conn:
             await conn.execute("DELETE FROM infomary_sessions WHERE session_id = $1", session_id)
+    except SessionAccessDenied:
+        raise
     except Exception as e:
         log_error(f"delete_session failed | session={session_id[:12]} | {e}")
         raise

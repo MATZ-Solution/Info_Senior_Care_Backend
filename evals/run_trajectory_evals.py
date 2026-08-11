@@ -45,9 +45,6 @@ async def _run_agent_turn(messages: list) -> tuple[str, list[str], list[dict], l
     tool_names_called: list[str] = []
     tool_calls_seen: list[dict] = []
     all_cards: list[dict] = []
-    # Phase 10: mirrors main.py's disclosure_required -- same per-turn scope
-    # (declared outside the round loop, not reset per-round), so the eval
-    # measures the actual post-fix runtime behavior, not the old flaky one.
     disclosure_required = False
     response = None
     for _ in range(5):

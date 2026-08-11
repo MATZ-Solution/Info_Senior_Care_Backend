@@ -3,17 +3,19 @@ Application entrypoint. Run with:
     uvicorn app.main:app --reload          (local dev)
     gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 4   (production)
 """
+import asyncio
 import logging
 import os
 import json
 import re
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import sentry_sdk
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -28,9 +30,12 @@ from app.api.v1.endpoints import health
 from app.api.v1.router import api_router
 from app.core.cache import close_cache_client
 from app.core.config import settings
+from app.core.security import decode_supabase_jwt, parse_authenticated_user
+from app.dependencies import optional_user_or_guest
 from app.middlewares.rate_limit import limiter
+from app.services.guest_session import verify_guest_token
 
-from tools.agent_tools import google_search, save_lead, facility_search
+from tools.agent_tools import google_search, facility_search
 from tools.explore_mode import ensure_facility_search_ready
 from tools.facility_search.search import DISCLOSURE_PREFIX
 from system_prompt.instructions import system_instructions
@@ -42,6 +47,8 @@ from database import (
     update_session_title,
     get_all_sessions,
     delete_session,
+    claim_session_if_anonymous,
+    SessionAccessDenied,
     get_dashboard_stats,
     get_all_leads,
     update_lead_status,
@@ -61,7 +68,7 @@ if settings.SENTRY_DSN:
 
 MAX_HISTORY_MESSAGES = 20
 
-_LEAKED_TOOL_CALL_RE = re.compile(r'^\s*(?:<function[=>])?\s*(?:save_lead|google_search|facility_search)\s*\{')
+_LEAKED_TOOL_CALL_RE = re.compile(r'^\s*(?:<function[=>])?\s*(?:google_search|facility_search)\s*\{')
 
 
 def _looks_like_leaked_tool_call(content: str) -> bool:
@@ -76,7 +83,7 @@ async def lifespan(app: FastAPI):
     log_startup("Provisioning facility search tables...")
     await ensure_facility_search_ready()
     log_startup(f"LLM model: openai/gpt-oss-120b")
-    log_startup(f"Tools bound: google_search, save_lead, facility_search")
+    log_startup(f"Tools bound: google_search, facility_search")
     log_divider("READY")
     yield
     log_startup("Shutting down — closing cache connections")
@@ -146,7 +153,7 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
     model="openai/gpt-oss-120b",
     temperature=0.1,
-).bind_tools([google_search, save_lead, facility_search])
+).bind_tools([google_search, facility_search])
 
 system_prompt = system_instructions
 
@@ -163,25 +170,8 @@ async def run_turn(messages: list, session_id: str) -> dict:
     """
     response = None
     t_start = time.time()
-    # One entry per facility found this turn, tagged cms_certified/not_certified
-    # for the frontend's flashcard UI. Initialized once per user turn (here),
-    # NOT inside the loop below -- a single turn can span multiple rounds of
-    # tool-calling before the LLM produces its final non-tool response, and
-    # resetting per-round would wipe out cards from an earlier round.
     turn_cards = []
-    # Signature (tool name + args) -> already-produced result string,
-    # for this turn only. llama-3.3 sometimes re-issues an identical
-    # tool call in a later round instead of answering (observed live:
-    # facility_search + save_lead both fired twice with the same
-    # args) -- re-running save_lead would double-write the lead, and
-    # re-running facility_search would double up turn_cards. Skip the
-    # real call and hand back the cached result instead.
     called_this_turn = {}
-    # Whether this turn's facility_search result requires the
-    # CMS-certification disclosure -- same per-turn scope as
-    # turn_cards/called_this_turn above, not reset per-round,
-    # since the disclosing facility_search call and the LLM's
-    # final non-tool response can be several rounds apart.
     disclosure_required = False
     tool_names_called = []
 
@@ -189,14 +179,6 @@ async def run_turn(messages: list, session_id: str) -> dict:
         try:
             response = await llm.ainvoke(messages)
         except Exception as e:
-            # Groq occasionally emits a malformed tool-call generation
-            # (raw "<function=name{...}>" text instead of a proper
-            # structured call) that its own API then rejects with a
-            # 400 -- observed live, not hypothetical. Sampling isn't
-            # fully deterministic even at low temperature, so one
-            # retry has a real chance of succeeding; anything else
-            # (e.g. rate limits) re-raises immediately to the
-            # per-turn handler, unchanged.
             err_text = str(e).lower()
             if "tool call validation failed" in err_text or "tool_use_failed" in err_text:
                 log_warn(f"[{session_id[:8]}] malformed tool-call generation -- retrying once")
@@ -298,6 +280,20 @@ async def run_turn(messages: list, session_id: str) -> dict:
     return {"output": output, "facility_cards": turn_cards or None, "tool_names_called": tool_names_called}
 
 
+def _resolve_ws_token(token: str) -> tuple[Optional[str], bool]:
+    """
+    Resolve a WS first-frame token to (user_id, is_guest). Returns
+    (None, False) if the token doesn't verify -- callers decide what to do
+    with that (fall back to anonymous, never reject the connection outright).
+    """
+    if token.startswith("guest_"):
+        return verify_guest_token(token), True
+    try:
+        return parse_authenticated_user(decode_supabase_jwt(token)).user_id, False
+    except HTTPException:
+        return None, False
+
+
 # ─── WebSocket Route ───────────────────────────────────────────
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
@@ -305,11 +301,55 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     log_divider(f"SESSION {session_id[:12]}")
     log_ws(f"Client connected  │ session={session_id}")
 
-    personalized_prompt = system_prompt + f"\n\nYour session_id for this conversation is: {session_id}\nYou MUST pass this exact session_id in every single save_lead tool call."
+    personalized_prompt = system_prompt + f"\n\nYour session_id for this conversation is: {session_id}"
+
+    # First frame is either an optional auth handshake ({"token": ...}) or,
+    # for clients that don't send one, straight into a real turn
+    # ({"message": ..., "history": ...}) -- kept fully backward-compatible
+    # with clients that have no concept of the auth frame. A bounded wait
+    # (rather than an unbounded receive_json()) means a socket that's opened
+    # and never sent anything gets closed instead of held open forever.
+    user_id: Optional[str] = None
+    pending_turn: Optional[dict] = None
+    try:
+        first = await asyncio.wait_for(websocket.receive_json(), timeout=15)
+    except (asyncio.TimeoutError, WebSocketDisconnect):
+        log_ws(f"Client sent nothing before timeout │ session={session_id}")
+        await websocket.close(code=1008)
+        return
+    except ValueError:
+        log_ws(f"Malformed first frame │ session={session_id}")
+        await websocket.close(code=1003)
+        return
+
+    if "token" in first:
+        resolved_id, is_guest = _resolve_ws_token(first.get("token") or "")
+        if resolved_id is None:
+            # Never reject the connection over a bad/expired token -- fall
+            # back to anonymous, but tell the client explicitly so it isn't
+            # silently downgraded (e.g. so it can trigger a token refresh).
+            await websocket.send_json({"auth": "failed", "fallback": "anonymous"})
+        else:
+            user_id = resolved_id
+            if not is_guest:
+                # Guest ids aren't guaranteed stable across reconnects (a
+                # fresh uuid4 per POST /api/v1/auth/guest call unless the
+                # client persists the token itself), so only real Supabase
+                # users get to adopt a pre-existing anonymous session.
+                await claim_session_if_anonymous(session_id, user_id)
+    elif "message" in first:
+        pending_turn = first
+    else:
+        log_ws(f"Unrecognized first frame shape │ session={session_id}")
+        await websocket.close(code=1003)
+        return
 
     try:
         while True:
-            data = await websocket.receive_json()
+            if pending_turn is not None:
+                data, pending_turn = pending_turn, None
+            else:
+                data = await websocket.receive_json()
             user_message = data.get("message", "")
             history = data.get("history", [])[-MAX_HISTORY_MESSAGES:]
 
@@ -331,7 +371,20 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         messages.append(AIMessage(content=msg["content"]))
                 messages.append(HumanMessage(content=user_message))
 
-                await save_message(session_id, "user", user_message)
+                try:
+                    await save_message(session_id, "user", user_message, user_id=user_id)
+                except SessionAccessDenied:
+                    # Someone else's session_id -- can't persist here, and
+                    # there's no HTTP status code to hand back mid-socket, so
+                    # send one explicit error frame and close instead.
+                    log_ws(f"Ownership conflict │ session={session_id}")
+                    await websocket.send_json({
+                        "response": None,
+                        "error": "session_owned_by_another_account",
+                        "message": "This conversation belongs to a different account. Please start a new chat.",
+                    })
+                    await websocket.close(code=4001)
+                    return
 
                 # Runs the whole tool-calling loop as one traced "chat_turn"
                 # run in LangSmith (see run_turn above).
@@ -339,7 +392,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 output = result["output"]
                 turn_cards = result["facility_cards"]
 
-                await save_message(session_id, "assistant", output, facility_cards=turn_cards)
+                await save_message(session_id, "assistant", output, facility_cards=turn_cards, user_id=user_id)
                 await websocket.send_json({"response": output, "facility_cards": turn_cards})
 
             except Exception as e:
@@ -357,47 +410,51 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
 
 # ─── Utility Routes ────────────────────────────────────────────
-@app.get("/test-supabase")
-async def test_supabase():
-    """Quick test to verify Supabase lead write works."""
-    from database import upsert_lead, db_pool
-    log_api(f"Supabase test | pool_ready={db_pool is not None}")
-    try:
-        await upsert_lead({
-            "lead_id": "TEST-001",
-            "session_id": "test-session",
-            "name": "Test User",
-            "email": "test@test.com",
-            "phone": "555-0000",
-            "care_need": "Test lead from /test-supabase",
-            "care_type": "Assisted Living",
-            "location": "Chicago, IL",
-            "age": "75", "gender": "", "living_arrangement": "",
-            "conditions": "", "insurance": "", "budget": "",
-            "notes": "Manual test", "status": "New", "email_sent": False,
-        })
-        log_api("Supabase test PASSED")
-        return {"status": "ok", "message": "Lead written to Supabase successfully"}
-    except Exception as e:
-        log_error(f"Supabase test FAILED | {type(e).__name__}: {e}")
-        return {"status": "error", "message": str(e)}
+# @app.get("/test-supabase")
+# async def test_supabase():
+#     """Quick test to verify Supabase lead write works."""
+#     from database import upsert_lead, db_pool
+#     log_api(f"Supabase test | pool_ready={db_pool is not None}")
+#     try:
+#         await upsert_lead({
+#             "lead_id": "TEST-001",
+#             "session_id": "test-session",
+#             "name": "Test User",
+#             "email": "test@test.com",
+#             "phone": "555-0000",
+#             "care_need": "Test lead from /test-supabase",
+#             "care_type": "Assisted Living",
+#             "location": "Chicago, IL",
+#             "age": "75", "gender": "", "living_arrangement": "",
+#             "conditions": "", "insurance": "", "budget": "",
+#             "notes": "Manual test", "status": "New", "email_sent": False,
+#         })
+#         log_api("Supabase test PASSED")
+#         return {"status": "ok", "message": "Lead written to Supabase successfully"}
+#     except Exception as e:
+#         log_error(f"Supabase test FAILED | {type(e).__name__}: {e}")
+#         return {"status": "error", "message": str(e)}
 
 
 @app.get("/history/{session_id}")
-async def get_history(session_id: str):
+async def get_history(session_id: str, current_user=Depends(optional_user_or_guest)):
     log_api(f"Fetch history | session={session_id[:12]}")
+    requester_id = current_user.user_id if current_user else None
     try:
-        messages = await fetch_history(session_id)
+        messages = await fetch_history(session_id, requester_user_id=requester_id)
         return {"messages": messages}
+    except SessionAccessDenied:
+        raise HTTPException(status_code=404, detail="Session not found")
     except Exception as e:
         log_error(f"get_history failed | session={session_id[:12]} | {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch history")
 
 
 @app.get("/sessions")
-async def get_sessions():
+async def get_sessions(current_user=Depends(optional_user_or_guest)):
     try:
-        sessions = await get_all_sessions()
+        requester_id = current_user.user_id if current_user else None
+        sessions = await get_all_sessions(user_id=requester_id)
         return {"sessions": sessions}
     except Exception as e:
         log_error(f"get_sessions failed | {e}")
@@ -411,7 +468,8 @@ class GenerateTitleRequest(BaseModel):
 
 
 @app.post("/generate-title")
-async def generate_title(req: GenerateTitleRequest):
+async def generate_title(req: GenerateTitleRequest, current_user=Depends(optional_user_or_guest)):
+    requester_id = current_user.user_id if current_user else None
     try:
         log_api(f"Generate title | session={req.session_id[:12]}")
         title_llm = ChatGroq(api_key=os.getenv("GROQ_API_KEY"), model="llama-3.3-70b-versatile", temperature=0.3)
@@ -421,8 +479,10 @@ async def generate_title(req: GenerateTitleRequest):
         for line in response.content.split("\n"):
             if line.startswith("Title:"): title = line.replace("Title:", "").strip()
             elif line.startswith("Description:"): description = line.replace("Description:", "").strip()
-        await update_session_title(req.session_id, title, description)
+        await update_session_title(req.session_id, title, description, requester_user_id=requester_id)
         return {"title": title, "description": description}
+    except SessionAccessDenied:
+        raise HTTPException(status_code=404, detail="Session not found")
     except Exception as e:
         log_error(f"generate_title failed | session={req.session_id[:12]} | {e}")
         return {"title": "New Conversation", "description": ""}
@@ -438,11 +498,14 @@ class UpdateLeadStatusRequest(BaseModel):
 
 
 @app.post("/delete-session")
-async def delete_session_endpoint(req: DeleteSessionRequest):
+async def delete_session_endpoint(req: DeleteSessionRequest, current_user=Depends(optional_user_or_guest)):
+    requester_id = current_user.user_id if current_user else None
     try:
         log_api(f"Delete session | session={req.session_id[:12]}")
-        await delete_session(req.session_id)
+        await delete_session(req.session_id, requester_user_id=requester_id)
         return {"status": "deleted"}
+    except SessionAccessDenied:
+        raise HTTPException(status_code=404, detail="Session not found")
     except Exception as e:
         log_error(f"delete_session failed | session={req.session_id[:12]} | {e}")
         raise HTTPException(status_code=500, detail="Failed to delete session")

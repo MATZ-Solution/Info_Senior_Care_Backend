@@ -369,6 +369,9 @@ const socket = new WebSocket(`${wsUrl}/ws/${sessionId}`)
 Open exactly one socket per active chat screen. Rules for its lifecycle:
 
 - Open it when the chat screen mounts / when `sessionId` is set.
+- **Optional auth handshake**: immediately after the socket opens, you may send one frame *before* the first real turn: `{ "token": "<supabase_jwt_or_guest_token>" }`. This ties the session to your account so it shows up in `GET /sessions` and `GET /history/{id}` scoped to you (see Part 13). It's entirely optional — a client that skips it and sends `{message, history}` immediately keeps working exactly as an anonymous chat does today. The server waits up to 15s for this first frame before closing the socket, so send *something* (even the first real turn) promptly after connecting.
+  - If the token is invalid/expired, you'll get back `{ "auth": "failed", "fallback": "anonymous" }` and the connection continues anonymously — treat this as a cue to refresh the token and reconnect if you want the session tied to the account.
+  - If a turn ever comes back as `{ "response": null, "error": "session_owned_by_another_account", "message": "..." }`, the socket is about to close (code `4001`) — this `sessionId` belongs to a different account than the one you authenticated as. Generate a new `sessionId` and reconnect.
 - Close it (`onclose = null` first, then `.close()`) when the screen unmounts or `sessionId` changes, to avoid leaking a stale connection.
 - On `onclose`, treat it as a disconnect and reconnect automatically with backoff (e.g. 2s → 4s → 8s, cap at 10s, give up after ~5 attempts and show a "Disconnected — Retry" banner with a manual retry button).
 - On `onerror`, mark the UI as disconnected (the `onclose` that typically follows will drive the reconnect).
@@ -532,7 +535,9 @@ This is enforced server-side even if the LLM's own phrasing drops it. **Do not a
 
 ## Part 13 — Chat Session Management (REST)
 
-These aren't part of the live chat turn itself — they handle session history/list management around it. They're plain root-level REST routes (not under `/api/v1`, not Supabase-authenticated), and their error shape is the standard `{"detail": "..."}` from Part 9.
+These aren't part of the live chat turn itself — they handle session history/list management around it. They're plain root-level REST routes (not under `/api/v1`), but **now Supabase-aware**: all four accept an optional `Authorization: Bearer <supabase_jwt_or_guest_token>` header (same tokens as Part 1), via the same `optional_user_or_guest` semantics used elsewhere — never a `401`, sending no header just means "anonymous caller." Their error shape is the standard `{"detail": "..."}` from Part 9.
+
+Ownership rule: a session becomes "owned" by whichever identity was on the WebSocket connection when it was created (or, for a real signed-in user, when they first reconnect to a previously-anonymous session — see Part 11.2's auth handshake). A session created with no token attached stays anonymous and is reachable by anyone who has its `session_id`, same as before this change. `404` from any of the routes below means "doesn't exist *or* isn't yours" — both cases are intentionally indistinguishable in the response, so a `session_id` can't be used to probe whether it exists.
 
 ### `GET /history/{session_id}`
 Loads everything persisted for a session. Use when a user reopens/switches to an existing session (hydrate the chat window before opening the WebSocket for new turns).
@@ -546,10 +551,10 @@ Loads everything persisted for a session. Use when a user reopens/switches to an
   ]
 }
 ```
-Same `ChatFacilityCard` shape as the WebSocket event, same rule: only render a card row when `facility_cards` is a non-empty array on that message. `role`/`content` map directly onto your chat bubble model. `500 {"detail": "Failed to fetch history"}` on failure.
+Same `ChatFacilityCard` shape as the WebSocket event, same rule: only render a card row when `facility_cards` is a non-empty array on that message. `role`/`content` map directly onto your chat bubble model. `404 {"detail": "Session not found"}` if the session belongs to someone else (or a made-up `session_id`) — see the ownership rule above. `500 {"detail": "Failed to fetch history"}` on other failures.
 
 ### `GET /sessions`
-Powers a sidebar/history list of past conversations.
+Powers a sidebar/history list of past conversations, **scoped to the caller**.
 
 ```json
 {
@@ -559,10 +564,10 @@ Powers a sidebar/history list of past conversations.
   ]
 }
 ```
-Ordered newest-first. Freshly created sessions show placeholder `"New Conversation"` / `""` until titled (next endpoint). `500 {"detail": "Failed to fetch sessions"}` on failure.
+Requires a token (real user or guest) — without one, this returns `{"sessions": []}`, not a global list (there is no "browse everyone's chats" mode). With a token, only sessions owned by that identity are returned. Ordered newest-first. Freshly created sessions show placeholder `"New Conversation"` / `""` until titled (next endpoint). `500 {"detail": "Failed to fetch sessions"}` on failure.
 
 ### `POST /generate-title`
-Call once per session, right after the **first** assistant reply lands, to auto-label it for the sidebar.
+Call once per session, right after the **first** assistant reply lands, to auto-label it for the sidebar. Also ownership-checked now: `404 {"detail": "Session not found"}` if the token doesn't own this session.
 
 Request:
 ```json
@@ -572,13 +577,13 @@ Response:
 ```json
 { "title": "Memory Care in Austin", "description": "Looking for memory care facility options" }
 ```
-Never errors out to the client — on any internal failure it falls back to `{"title": "New Conversation", "description": ""}` with a `200`, so don't add error handling for this one beyond the normal fetch failure path. After this call, re-fetch `GET /sessions` so the sidebar picks up the new title. Track "have I titled this session yet" client-side (e.g. a ref/flag reset on new session) so you don't call this on every turn.
+On any *internal* failure it still falls back to `{"title": "New Conversation", "description": ""}` with a `200` as before — only the ownership check is a hard `404`. After this call, re-fetch `GET /sessions` so the sidebar picks up the new title. Track "have I titled this session yet" client-side (e.g. a ref/flag reset on new session) so you don't call this on every turn.
 
 ### `POST /delete-session`
 ```json
 { "session_id": "3f9a..." }
 ```
-→ `{ "status": "deleted" }`. Removes the session and its messages. If the deleted session is the one currently open, start a new chat; otherwise just refresh the session list. `500 {"detail": "Failed to delete session"}` on failure.
+→ `{ "status": "deleted" }`. Removes the session and its messages. `404 {"detail": "Session not found"}` if it belongs to someone else. If the deleted session is the one currently open, start a new chat; otherwise just refresh the session list. `500 {"detail": "Failed to delete session"}` on other failures.
 
 ### `GET /test-supabase`
 Manual diagnostic route (writes a hardcoded test lead row to Supabase) — **not part of the frontend contract**, don't call it from the app. Left in for backend debugging only.

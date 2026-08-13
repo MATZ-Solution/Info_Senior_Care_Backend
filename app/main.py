@@ -35,7 +35,7 @@ from app.dependencies import optional_user_or_guest
 from app.middlewares.rate_limit import limiter
 from app.services.guest_session import verify_guest_token
 
-from tools.agent_tools import google_search, facility_search
+from tools.agent_tools import google_search, save_lead, facility_search
 from tools.explore_mode import ensure_facility_search_ready
 from tools.facility_search.search import DISCLOSURE_PREFIX
 from system_prompt.instructions import system_instructions
@@ -153,7 +153,7 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
     model="openai/gpt-oss-120b",
     temperature=0.1,
-).bind_tools([google_search, facility_search])
+).bind_tools([google_search, save_lead, facility_search])
 
 system_prompt = system_instructions
 
@@ -175,7 +175,7 @@ async def run_turn(messages: list, session_id: str) -> dict:
     disclosure_required = False
     tool_names_called = []
 
-    for i in range(5):
+    for i in range(6):
         try:
             response = await llm.ainvoke(messages)
         except Exception as e:
@@ -223,6 +223,8 @@ async def run_turn(messages: list, session_id: str) -> dict:
                                 }
                                 for r in tool_message.artifact
                             )
+                    elif tool_name == "save_lead":
+                        result = await save_lead.ainvoke(tool_args)
                     elif tool_name == "facility_search":
                         tool_message = await facility_search.ainvoke(tc)
                         result = tool_message.content
@@ -301,7 +303,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     log_divider(f"SESSION {session_id[:12]}")
     log_ws(f"Client connected  │ session={session_id}")
 
-    personalized_prompt = system_prompt + f"\n\nYour session_id for this conversation is: {session_id}"
+    personalized_prompt = system_prompt + f"\n\nYour session_id for this conversation is: {session_id}\nYou MUST pass this exact session_id in every single save_lead tool call."
 
     # First frame is either an optional auth handshake ({"token": ...}) or,
     # for clients that don't send one, straight into a real turn

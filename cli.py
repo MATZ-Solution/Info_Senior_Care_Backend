@@ -35,7 +35,7 @@ from langchain_groq import ChatGroq
 
 from database import close_db_pool, init_db_pool
 from system_prompt.instructions import system_instructions
-from tools.agent_tools import facility_search, google_search, save_lead
+from tools.agent_tools import facility_search, google_search
 from tools.explore_mode import ensure_facility_search_ready
 from tools.facility_search.search import DISCLOSURE_PREFIX
 
@@ -56,7 +56,7 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
     model="openai/gpt-oss-120b",
     temperature=0.1,
-).bind_tools([google_search, save_lead, facility_search])
+).bind_tools([google_search, facility_search])
 
 
 def _print_cards(cards: list[dict]) -> None:
@@ -136,8 +136,6 @@ async def run_turn(system_prompt: str, history: list[dict], user_message: str) -
                                 }
                                 for r in tool_message.artifact
                             )
-                    elif tool_name == "save_lead":
-                        result = await save_lead.ainvoke(tool_args)
                     elif tool_name == "facility_search":
                         tool_message = await facility_search.ainvoke(tc)
                         result = tool_message.content
@@ -170,8 +168,7 @@ async def run_turn(system_prompt: str, history: list[dict], user_message: str) -
 def _new_session() -> tuple[str, str]:
     session_id = str(uuid.uuid4())
     prompt = system_instructions + (
-        f"\n\nYour session_id for this conversation is: {session_id}\n"
-        "You MUST pass this exact session_id in every single save_lead tool call."
+        f"\n\nYour session_id for this conversation is: {session_id}"
     )
     print(f"[session] {session_id}")
     return session_id, prompt

@@ -482,6 +482,7 @@ async def generate_title(req: GenerateTitleRequest, current_user=Depends(optiona
             if line.startswith("Title:"): title = line.replace("Title:", "").strip()
             elif line.startswith("Description:"): description = line.replace("Description:", "").strip()
         await update_session_title(req.session_id, title, description, requester_user_id=requester_id)
+        print(title)
         return {"title": title, "description": description}
     except SessionAccessDenied:
         raise HTTPException(status_code=404, detail="Session not found")

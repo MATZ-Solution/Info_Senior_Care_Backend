@@ -20,6 +20,7 @@ Usage:
 Commands inside the REPL:
     /reset    start a new session (fresh session_id, clears history)
     /history  print the plain user/assistant history sent to the LLM
+    /title    run the same /generate-title logic as app/main.py on the last exchange
     /exit     quit
 """
 import asyncio
@@ -33,7 +34,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_groq import ChatGroq
 
-from database import close_db_pool, init_db_pool
+from database import close_db_pool, init_db_pool, update_session_title, SessionAccessDenied
 from system_prompt.instructions import system_instructions
 from tools.agent_tools import facility_search, google_search
 from tools.explore_mode import ensure_facility_search_ready
@@ -165,6 +166,29 @@ async def run_turn(system_prompt: str, history: list[dict], user_message: str) -
     return output, turn_cards
 
 
+async def generate_title(session_id: str, user_message: str, ai_response: str) -> dict:
+    """Mirrors the POST /generate-title endpoint in app/main.py: same model,
+    same prompt, same Title:/Description: parsing, same DB write. Lets this
+    be exercised from the CLI without spinning up FastAPI."""
+    try:
+        title_llm = ChatGroq(api_key=os.getenv("GROQ_API_KEY"), model="llama-3.3-70b-versatile", temperature=0.3)
+        prompt = f"Generate a SHORT title and description for this chat: {user_message} | {ai_response}. Format: Title: [X] Description: [Y]"
+        response = await title_llm.ainvoke(prompt)
+        title, description = "New Conversation", ""
+        for line in response.content.split("\n"):
+            if line.startswith("Title:"): title = line.replace("Title:", "").strip()
+            elif line.startswith("Description:"): description = line.replace("Description:", "").strip()
+        await update_session_title(session_id, title, description, requester_user_id=None)
+        print(title)
+        return {"title": title, "description": description}
+    except SessionAccessDenied:
+        print("[error] session not found in DB (cli.py doesn't persist messages, so title can't be saved)")
+        return {"title": "New Conversation", "description": ""}
+    except Exception as e:
+        print(f"[error] generate_title failed: {e}")
+        return {"title": "New Conversation", "description": ""}
+
+
 def _new_session() -> tuple[str, str]:
     session_id = str(uuid.uuid4())
     prompt = system_instructions + (
@@ -201,6 +225,16 @@ async def main() -> None:
             if user_message == "/history":
                 for m in history:
                     print(f"  {m['role']}: {m['content'][:200]}")
+                continue
+            if user_message == "/title":
+                if len(history) < 2:
+                    print("[error] need at least one full exchange before generating a title")
+                    continue
+                last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+                last_assistant = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+                result = await generate_title(session_id, last_user, last_assistant)
+                print(f"[title] {result['title']}")
+                print(f"[description] {result['description']}\n")
                 continue
 
             try:

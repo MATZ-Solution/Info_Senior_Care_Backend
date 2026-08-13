@@ -2,29 +2,17 @@ import os
 import uuid
 import asyncio
 import traceback
+import time
 from datetime import datetime
 from dotenv import load_dotenv
-import gspread
 import resend
-import json
-import httpx
-import logging
-import time
-from google.oauth2.service_account import Credentials
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
-from logger import log_lead, log_sheet, log_email, log_search, log_error, log_warn, log_success
+from logger import log_lead, log_email, log_search, log_error, log_success
 from tools.explore_mode import search_facilities
 from tools.web_search import web_search
 
 load_dotenv()
-
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1sJYvoP4BOVeMWaFGBOPTtpuJKrY847n3GQzElQyPRKY/edit?usp=sharing"
-CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), "credentials.json")
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
 
 # Session tracking for progressive saving
 _sessions: dict = {}
@@ -248,50 +236,11 @@ async def _send_email(lead: dict) -> dict:
         log_error(f"Email failed      │ lead={lead.get('lead_id')} │ {e}")
         return {"success": False, "error": str(e)}
 
-async def _upsert_sheet(lead: dict, session_id: str) -> dict:
-    t = time.time()
-    try:
-        loop = asyncio.get_event_loop()
-
-        def _run():
-            creds_json = os.getenv("GOOGLE_CREDENTIALS")
-            if creds_json:
-                creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
-            else:
-                creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
-            client = gspread.authorize(creds)
-            sheet = client.open_by_url(SHEET_URL).sheet1
-            row_data = [
-                lead.get("lead_id",""), lead.get("name",""), lead.get("email",""), lead.get("phone",""),
-                lead.get("care_need",""), lead.get("location",""), lead.get("status","New"), lead.get("notes",""),
-                lead.get("saved_at",""), lead.get("age",""), lead.get("gender",""), lead.get("living_arrangement",""),
-                lead.get("physician",""), lead.get("conditions",""), lead.get("hospitalizations",""),
-                lead.get("medications",""), lead.get("allergies",""), lead.get("care_type",""),
-                lead.get("care_hours",""), lead.get("insurance",""), lead.get("budget",""),
-                lead.get("home_hazards",""), lead.get("medical_equipment",""), lead.get("other_factors",""),
-                lead.get("transportation",""),
-            ]
-            existing_row = _sessions[session_id].get("row_index")
-            if existing_row:
-                sheet.update(f"A{existing_row}:Y{existing_row}", [row_data])
-            else:
-                sheet.append_row(row_data)
-                col_a = sheet.col_values(1)
-                _sessions[session_id]["row_index"] = len(col_a)
-
-        await loop.run_in_executor(None, _run)
-        ms = int((time.time() - t) * 1000)
-        log_sheet(f"Sheet saved | lead={lead.get('lead_id')} | {ms}ms")
-        return {"success": True}
-    except Exception as e:
-        log_error(f"Sheet FAILED | lead={lead.get('lead_id')} | {e}")
-        return {"success": False, "error": str(e)}
-
 async def _persist_lead(lead: dict, session_id: str, has_name: bool, has_contact: bool, has_email: bool, email_sent: bool):
     """Shield-protected: runs even if parent function call is cancelled."""
     lead_id = lead["lead_id"]
 
-    # 1. Supabase first (fast ~300ms)
+    # Supabase -- source of truth for the dashboard's leads view.
     try:
         import database as _db
         if _db.db_pool is None:
@@ -306,7 +255,7 @@ async def _persist_lead(lead: dict, session_id: str, has_name: bool, has_contact
         log_error(f"Supabase FAILED | lead={lead_id} | {type(e).__name__}: {e}")
         log_error(traceback.format_exc())
 
-    # 2. Send emails if name + (phone or email) received for first time
+    # Send emails if name + (phone or email) received for first time
     if has_name and has_contact and not email_sent:
         result = await _send_email(lead)
         if has_email:
@@ -319,16 +268,6 @@ async def _persist_lead(lead: dict, session_id: str, has_name: bool, has_contact
                 await _db.upsert_lead({**lead, "session_id": session_id, "email_sent": True})
             except Exception as e:
                 log_error(f"Supabase email_sent update FAILED | lead={lead_id} | {e}")
-
-    # 3. Google Sheet last (slow ~2-3s) — background, won't block anything
-    asyncio.create_task(_sheet_save_bg(lead, session_id))
-
-
-async def _sheet_save_bg(lead: dict, session_id: str):
-    try:
-        await _upsert_sheet(lead, session_id)
-    except Exception as e:
-        log_error(f"Sheet FAILED (bg) | lead={lead['lead_id']} | {e}")
 
 
 async def _save_lead(
@@ -347,7 +286,6 @@ async def _save_lead(
     if is_new:
         _sessions[session_id] = {
             "lead_id": str(uuid.uuid4())[:8].upper(),
-            "row_index": None,
             "email_sent": False,
             "data": {},
         }

@@ -369,6 +369,9 @@ const socket = new WebSocket(`${wsUrl}/ws/${sessionId}`)
 Open exactly one socket per active chat screen. Rules for its lifecycle:
 
 - Open it when the chat screen mounts / when `sessionId` is set.
+- **Optional auth handshake**: immediately after the socket opens, you may send one frame *before* the first real turn: `{ "token": "<supabase_jwt_or_guest_token>" }`. This ties the session to your account so it shows up in `GET /sessions` and `GET /history/{id}` scoped to you (see Part 13). It's entirely optional — a client that skips it and sends `{message, history}` immediately keeps working exactly as an anonymous chat does today. The server waits up to 15s for this first frame before closing the socket, so send *something* (even the first real turn) promptly after connecting.
+  - If the token is invalid/expired, you'll get back `{ "auth": "failed", "fallback": "anonymous" }` and the connection continues anonymously — treat this as a cue to refresh the token and reconnect if you want the session tied to the account.
+  - If a turn ever comes back as `{ "response": null, "error": "session_owned_by_another_account", "message": "..." }`, the socket is about to close (code `4001`) — this `sessionId` belongs to a different account than the one you authenticated as. Generate a new `sessionId` and reconnect.
 - Close it (`onclose = null` first, then `.close()`) when the screen unmounts or `sessionId` changes, to avoid leaking a stale connection.
 - On `onclose`, treat it as a disconnect and reconnect automatically with backoff (e.g. 2s → 4s → 8s, cap at 10s, give up after ~5 attempts and show a "Disconnected — Retry" banner with a manual retry button).
 - On `onerror`, mark the UI as disconnected (the `onclose` that typically follows will drive the reconnect).
@@ -452,13 +455,22 @@ No special-casing is needed for these beyond displaying them as a normal assista
 interface ChatFacilityCard {
   source: 'cms_certified' | 'not_certified'
 
-  // present only when source === 'cms_certified'
-  name?: string                  // facility name
-  facility_type_label?: string   // e.g. "Nursing Home", "Home Health Agency", "Hospice"
-  city?: string
-  state?: string
-  phone?: string
-  highlight?: string             // short badge text, e.g. a quality-rating callout — may be absent
+  // present only when source === 'cms_certified'.
+  // Every key below is ALWAYS present on a certified card — a missing value
+  // is `null`, never an omitted key. So `card.phone === null` is the check,
+  // not `'phone' in card`. (On a not_certified card these keys don't exist
+  // at all, hence the `?` — check `source` first.)
+  id?: string                    // pass to GET /facilities/{id} for the detail screen (Part 3)
+  name?: string                  // facility name — comes through ALL-CAPS from CMS, title-case it client-side
+  facility_type_label?: string   // e.g. "Nursing Home", "Home Health Agency", "Hospice Provider"
+  address_line1?: string | null  // street address
+  city?: string | null
+  state?: string | null
+  zip_code?: string | null
+  phone?: string | null          // NOT normalized — may be "(512) 372-4194" or "5123355028"
+  ownership_type?: string | null // "for_profit" | "nonprofit" | "government" | "unknown" — see note below
+  highlight?: string | null      // badge text, e.g. "4/5 CMS rating". Null unless the facility has a CMS star rating (nursing homes + home health agencies only — hospice/assisted living/etc. never do)
+  note?: string | null           // rare advisory that MUST be shown when non-null (see 12.3.4)
 
   // present only when source === 'not_certified' (general web search fallback)
   title?: string
@@ -467,18 +479,28 @@ interface ChatFacilityCard {
 }
 ```
 
+**Two values that are present but meaningless — treat as missing:**
+
+- `ownership_type` is the literal string `"unknown"` on many rows, not `null`. Guard both: `o && o !== 'unknown'`.
+- `phone` is inconsistently formatted in the source data; format client-side if you need it uniform.
+
 ### 12.2 Example payloads
 
-CMS-certified result:
+CMS-certified result (a real response — note `highlight`/`note` are `null`, not omitted):
 ```json
 {
+  "id": "a925a22b-866e-4968-9f68-ecd9abefda3c",
   "source": "cms_certified",
-  "name": "Golden Years Nursing Home",
-  "facility_type_label": "Nursing Home",
+  "name": "ACCENTCARE HOSPICE & PALLIATIVE CARE - AUSTIN",
+  "facility_type_label": "Hospice Provider",
+  "address_line1": "3520 EXECUTIVE CENTER DR STE 320",
   "city": "Austin",
   "state": "TX",
-  "phone": "(512) 555-0182",
-  "highlight": "5-star CMS rating"
+  "zip_code": "78731",
+  "phone": "(512) 372-4194",
+  "ownership_type": "for_profit",
+  "highlight": null,
+  "note": null
 }
 ```
 
@@ -495,7 +517,9 @@ Web-fallback result (no certified match found):
 ### 12.3 Rendering rules
 
 1. **One card row per assistant message that has cards**, positioned directly below that message's chat bubble — not a global/floating list.
-2. **`cms_certified` cards** get a visually distinct "certified" treatment (e.g. green accent, a certified badge/stamp icon) — show `name`, `facility_type_label`, `city`/`state` joined with a comma, `phone` if present, and `highlight` as a small pill/badge if present.
+2. **`cms_certified` cards** get a visually distinct "certified" treatment (e.g. green accent, a certified badge/stamp icon) — show `name`, `facility_type_label`, `city`/`state` joined with a comma, `phone` if present, and `highlight` as a small pill/badge if present. `address_line1`, `zip_code` and `ownership_type` are also available for a fuller address line or a details panel; each can be null, so render them conditionally rather than assuming they're set.
+   - **Details button** — pass `card.id` to `GET /api/v1/facilities/{id}` (Part 3) to open the detail screen. Use this id verbatim; do NOT re-look-up the facility by name/city, which is what causes the wrong facility's details to load. `not_certified` cards have no `id` and get no Details button — link out to `url` instead.
+   - **`note`** — when non-null, it MUST be displayed on the card. It carries an advisory the user needs in order to read the result correctly (e.g. a nursing staffing agency supplies staff to facilities and is not a residence or care location). It is null on the vast majority of cards.
 3. **`not_certified` cards** get a visually distinct "not certified" treatment (e.g. orange accent) with an explicit label like "Not CMS-certified — from general web search" — show `title` (as a link to `url` if present, else plain text) and `snippet` if present.
 4. **Multiple cards**: render as a swipeable/paginated row (prev/next controls + "`n / total`" indicator), not a long vertical list — a turn can return several cards.
 
@@ -511,7 +535,9 @@ This is enforced server-side even if the LLM's own phrasing drops it. **Do not a
 
 ## Part 13 — Chat Session Management (REST)
 
-These aren't part of the live chat turn itself — they handle session history/list management around it. They're plain root-level REST routes (not under `/api/v1`, not Supabase-authenticated), and their error shape is the standard `{"detail": "..."}` from Part 9.
+These aren't part of the live chat turn itself — they handle session history/list management around it. They're plain root-level REST routes (not under `/api/v1`), but **now Supabase-aware**: all four accept an optional `Authorization: Bearer <supabase_jwt_or_guest_token>` header (same tokens as Part 1), via the same `optional_user_or_guest` semantics used elsewhere — never a `401`, sending no header just means "anonymous caller." Their error shape is the standard `{"detail": "..."}` from Part 9.
+
+Ownership rule: a session becomes "owned" by whichever identity was on the WebSocket connection when it was created (or, for a real signed-in user, when they first reconnect to a previously-anonymous session — see Part 11.2's auth handshake). A session created with no token attached stays anonymous and is reachable by anyone who has its `session_id`, same as before this change. `404` from any of the routes below means "doesn't exist *or* isn't yours" — both cases are intentionally indistinguishable in the response, so a `session_id` can't be used to probe whether it exists.
 
 ### `GET /history/{session_id}`
 Loads everything persisted for a session. Use when a user reopens/switches to an existing session (hydrate the chat window before opening the WebSocket for new turns).
@@ -525,10 +551,10 @@ Loads everything persisted for a session. Use when a user reopens/switches to an
   ]
 }
 ```
-Same `ChatFacilityCard` shape as the WebSocket event, same rule: only render a card row when `facility_cards` is a non-empty array on that message. `role`/`content` map directly onto your chat bubble model. `500 {"detail": "Failed to fetch history"}` on failure.
+Same `ChatFacilityCard` shape as the WebSocket event, same rule: only render a card row when `facility_cards` is a non-empty array on that message. `role`/`content` map directly onto your chat bubble model. `404 {"detail": "Session not found"}` if the session belongs to someone else (or a made-up `session_id`) — see the ownership rule above. `500 {"detail": "Failed to fetch history"}` on other failures.
 
 ### `GET /sessions`
-Powers a sidebar/history list of past conversations.
+Powers a sidebar/history list of past conversations, **scoped to the caller**.
 
 ```json
 {
@@ -538,10 +564,10 @@ Powers a sidebar/history list of past conversations.
   ]
 }
 ```
-Ordered newest-first. Freshly created sessions show placeholder `"New Conversation"` / `""` until titled (next endpoint). `500 {"detail": "Failed to fetch sessions"}` on failure.
+Requires a token (real user or guest) — without one, this returns `{"sessions": []}`, not a global list (there is no "browse everyone's chats" mode). With a token, only sessions owned by that identity are returned. Ordered newest-first. Freshly created sessions show placeholder `"New Conversation"` / `""` until titled (next endpoint). `500 {"detail": "Failed to fetch sessions"}` on failure.
 
 ### `POST /generate-title`
-Call once per session, right after the **first** assistant reply lands, to auto-label it for the sidebar.
+Call once per session, right after the **first** assistant reply lands, to auto-label it for the sidebar. Also ownership-checked now: `404 {"detail": "Session not found"}` if the token doesn't own this session.
 
 Request:
 ```json
@@ -551,13 +577,13 @@ Response:
 ```json
 { "title": "Memory Care in Austin", "description": "Looking for memory care facility options" }
 ```
-Never errors out to the client — on any internal failure it falls back to `{"title": "New Conversation", "description": ""}` with a `200`, so don't add error handling for this one beyond the normal fetch failure path. After this call, re-fetch `GET /sessions` so the sidebar picks up the new title. Track "have I titled this session yet" client-side (e.g. a ref/flag reset on new session) so you don't call this on every turn.
+On any *internal* failure it still falls back to `{"title": "New Conversation", "description": ""}` with a `200` as before — only the ownership check is a hard `404`. After this call, re-fetch `GET /sessions` so the sidebar picks up the new title. Track "have I titled this session yet" client-side (e.g. a ref/flag reset on new session) so you don't call this on every turn.
 
 ### `POST /delete-session`
 ```json
 { "session_id": "3f9a..." }
 ```
-→ `{ "status": "deleted" }`. Removes the session and its messages. If the deleted session is the one currently open, start a new chat; otherwise just refresh the session list. `500 {"detail": "Failed to delete session"}` on failure.
+→ `{ "status": "deleted" }`. Removes the session and its messages. `404 {"detail": "Session not found"}` if it belongs to someone else. If the deleted session is the one currently open, start a new chat; otherwise just refresh the session list. `500 {"detail": "Failed to delete session"}` on other failures.
 
 ### `GET /test-supabase`
 Manual diagnostic route (writes a hardcoded test lead row to Supabase) — **not part of the frontend contract**, don't call it from the app. Left in for backend debugging only.

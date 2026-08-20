@@ -92,9 +92,17 @@ async def flush_cache_before_tests():
     degrade-gracefully design doesn't fully protect against on its own.
     Production ops note: flush the cache after any bulk facility reimport
     for the same reason.
+
+    Degrades gracefully if no local Valkey is reachable (e.g. running just
+    the tool-calling/agent tests, which don't touch the cache at all) --
+    tests that actually depend on cache state still need a real Valkey and
+    will fail on their own if it's missing.
     """
     from app.core.cache import get_cache_client
 
-    client = get_cache_client()
-    await client.flushdb()
+    try:
+        client = get_cache_client()
+        await asyncio.wait_for(client.flushdb(), timeout=2)
+    except Exception:
+        pass
     yield

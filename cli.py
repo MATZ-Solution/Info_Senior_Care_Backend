@@ -168,25 +168,28 @@ async def run_turn(system_prompt: str, history: list[dict], user_message: str) -
 
 async def generate_title(session_id: str, user_message: str, ai_response: str) -> dict:
     """Mirrors the POST /generate-title endpoint in app/main.py: same model,
-    same prompt, same Title:/Description: parsing, same DB write. Lets this
-    be exercised from the CLI without spinning up FastAPI."""
+    same prompt, same Description: parsing, same DB write. Lets this
+    be exercised from the CLI without spinning up FastAPI.
+
+    The LLM call/parse and the DB persist are kept as separate failure
+    domains -- cli.py never creates a session row (see module docstring), so
+    the persist step is expected to fail here. That shouldn't hide the description
+    the LLM actually generated, the way app/main.py's single try/except would."""
+    title_llm = ChatGroq(api_key=os.getenv("GROQ_API_KEY"), model="llama-3.3-70b-versatile", temperature=0.3)
+    prompt = f"Generate a SHORT description for this chat: {user_message} | {ai_response}. Format: Description: [X]"
+    response = await title_llm.ainvoke(prompt)
+    description = "New Conversation", ""
+    for line in response.content.split("\n"):
+        if line.startswith("Description:"): description = line.replace("Description:", "").strip()
+
     try:
-        title_llm = ChatGroq(api_key=os.getenv("GROQ_API_KEY"), model="llama-3.3-70b-versatile", temperature=0.3)
-        prompt = f"Generate a SHORT title and description for this chat: {user_message} | {ai_response}. Format: Title: [X] Description: [Y]"
-        response = await title_llm.ainvoke(prompt)
-        title, description = "New Conversation", ""
-        for line in response.content.split("\n"):
-            if line.startswith("Title:"): title = line.replace("Title:", "").strip()
-            elif line.startswith("Description:"): description = line.replace("Description:", "").strip()
-        await update_session_title(session_id, title, description, requester_user_id=None)
-        print(title)
-        return {"title": title, "description": description}
+        await update_session_title(session_id, description, requester_user_id=None)
     except SessionAccessDenied:
-        print("[error] session not found in DB (cli.py doesn't persist messages, so title can't be saved)")
-        return {"title": "New Conversation", "description": ""}
+        print("[warn] session not found in DB (cli.py doesn't persist messages, so title can't be saved) -- showing generated title anyway")
     except Exception as e:
-        print(f"[error] generate_title failed: {e}")
-        return {"title": "New Conversation", "description": ""}
+        print(f"[warn] update_session_title failed: {e} -- showing generated title anyway")
+
+    return {"description": description}
 
 
 def _new_session() -> tuple[str, str]:
@@ -232,9 +235,11 @@ async def main() -> None:
                     continue
                 last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
                 last_assistant = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
-                result = await generate_title(session_id, last_user, last_assistant)
-                print(f"[title] {result['title']}")
-                print(f"[description] {result['description']}\n")
+                try:
+                    result = await generate_title(session_id, last_user, last_assistant)
+                    print(f"[description] {result['description']}\n")
+                except Exception as e:
+                    print(f"[error] generate_title failed: {e}")
                 continue
 
             try:

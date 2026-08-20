@@ -6,15 +6,16 @@ Application entrypoint. Run with:
 import asyncio
 import logging
 import os
-import json
-import re
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import groq
 import sentry_sdk
 import uvicorn
 from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelRetryMiddleware
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,8 +38,19 @@ from app.services.guest_session import verify_guest_token
 
 from tools.agent_tools import google_search, save_lead, facility_search
 from tools.explore_mode import ensure_facility_search_ready
-from tools.facility_search.search import DISCLOSURE_PREFIX
 from system_prompt.instructions import system_instructions
+from app.middlewares.agent_middleware import (
+    AgentContext,
+    CardExtractionMiddleware,
+    DisclosureEnforcementMiddleware,
+    FinalOutputValidationMiddleware,
+    GENERIC_FALLBACK_TEXT,
+    LeakedToolCallRetryMiddleware,
+    ProviderRetryMiddleware,
+    SessionIdOverrideMiddleware,
+    ToolCallDedupMiddleware,
+    ToolErrorSafetyNetMiddleware,
+)
 from database import (
     init_db_pool,
     close_db_pool,
@@ -67,12 +79,7 @@ if settings.SENTRY_DSN:
     sentry_sdk.init(dsn=settings.SENTRY_DSN, environment=settings.ENVIRONMENT, traces_sample_rate=0.1)
 
 MAX_HISTORY_MESSAGES = 20
-
-_LEAKED_TOOL_CALL_RE = re.compile(r'^\s*(?:<function[=>])?\s*(?:google_search|facility_search)\s*\{')
-
-
-def _looks_like_leaked_tool_call(content: str) -> bool:
-    return bool(_LEAKED_TOOL_CALL_RE.match(content or ""))
+TOOL_CALL_TIMEOUT_SECONDS = 20
 
 
 @asynccontextmanager
@@ -97,9 +104,6 @@ app = FastAPI(
     title="InfoSenior Care API",
     version="1.0.0",
     lifespan=lifespan,
-    # Hide interactive docs in production -- avoids exposing the full API
-    # surface/schema publicly; enable explicitly if you want a staging
-    # environment with docs on.
     docs_url="/docs" if not settings.is_production else None,
     redoc_url="/redoc" if not settings.is_production else None,
     openapi_url="/openapi.json" if not settings.is_production else None,
@@ -112,7 +116,7 @@ app.state.limiter = limiter
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-        content={"detail": "Rate limit exceeded -- please slow down and try again shortly."},
+        content={"detail": "The service is temporarily busy due to high demand. Please try again in a few moments."},
     )
 
 
@@ -126,9 +130,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    # Never leak internal error details (stack traces, DB errors, etc) to
-    # clients -- log the full detail server-side (Sentry captures it too),
-    # return a generic message.
     logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -153,133 +154,134 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
     model="openai/gpt-oss-120b",
     temperature=0.1,
-).bind_tools([google_search, save_lead, facility_search])
+)
 
 system_prompt = system_instructions
+
+infoAgent_middleware = [
+    ProviderRetryMiddleware(
+        max_retries=3,
+        retry_on=(groq.RateLimitError, groq.APIConnectionError, groq.InternalServerError),
+        backoff_factor=2.0,
+        initial_delay=1.0,
+        max_delay=20.0,
+        jitter=True,
+        on_failure="error",
+    ),
+    ModelRetryMiddleware(
+        max_retries=1,
+        retry_on=lambda e: "tool call validation failed" in str(e).lower() or "tool_use_failed" in str(e).lower(),
+        on_failure="error",
+    ),
+    LeakedToolCallRetryMiddleware(),
+    ToolCallDedupMiddleware(),
+    SessionIdOverrideMiddleware(),
+    CardExtractionMiddleware(),
+    ToolErrorSafetyNetMiddleware(timeout_seconds=TOOL_CALL_TIMEOUT_SECONDS),
+    FinalOutputValidationMiddleware(),
+    DisclosureEnforcementMiddleware(),
+]
+
+infoAgent = create_agent(
+    model=llm,
+    tools=[google_search, save_lead, facility_search],
+    middleware=infoAgent_middleware,
+    context_schema=AgentContext,
+)
 
 
 @traceable(name="chat_turn", run_type="chain")
 async def run_turn(messages: list, session_id: str) -> dict:
     """
-    Runs the full tool-calling loop for one user turn: call tool(s) -> feed
-    result back -> maybe call more -> final non-tool response. Wrapped in
-    @traceable so the whole turn (including every nested LLM call and tool
-    call) lands in LangSmith as a single "chat_turn" run instead of several
-    disconnected root runs -- this is what lets an online evaluator inspect
-    "which tools were called with what args" for a given turn.
+    Runs one user turn via infoAgent's own model -> tool -> model loop, then
+    extracts the pieces the websocket layer needs. Wrapped in @traceable so
+    the whole turn (including every nested LLM call and tool call) lands in
+    LangSmith as a single "chat_turn" run instead of several disconnected
+    root runs -- this is what lets an online evaluator inspect "which tools
+    were called with what args" for a given turn.
     """
-    response = None
     t_start = time.time()
-    turn_cards = []
-    called_this_turn = {}
-    disclosure_required = False
-    tool_names_called = []
+    turn_length_before = len(messages)
 
-    for i in range(6):
-        try:
-            response = await llm.ainvoke(messages)
-        except Exception as e:
-            err_text = str(e).lower()
-            if "tool call validation failed" in err_text or "tool_use_failed" in err_text:
-                log_warn(f"[{session_id[:8]}] malformed tool-call generation -- retrying once")
-                response = await llm.ainvoke(messages)
-            else:
-                raise
+    try:
+        result = await infoAgent.ainvoke({"messages": messages}, context={"session_id": session_id})
+    except groq.AuthenticationError as e:
+        log_error(f"[{session_id[:8]}] GROQ AUTHENTICATION FAILED -- check GROQ_API_KEY | {e}")
+        return {
+            "output": "We're currently experiencing a service issue and can't process your request right now. Please try again later.", "facility_cards": None, 
+            "tool_names_called": []
+        }
+    except groq.RateLimitError as e:
+        log_warn(f"[{session_id[:8]}] Groq rate limited after retries exhausted | {e}")
+        return {
+            "output": "The service is temporarily busy due to high demand. Please try again in a few moments.", 
+            "facility_cards": None, 
+            "tool_names_called": []
+        }
+    except groq.APIError as e:
+        # Catches everything else: APIConnectionError/APITimeoutError,
+        # InternalServerError ("provider unavailable"), and any
+        # BadRequestError the tool_use_failed retry above didn't recover
+        # from -- all genuinely exhausted their own retry budget already.
+        log_error(f"[{session_id[:8]}] Groq API error after retries exhausted | {type(e).__name__}: {e}")
+        return {
+            "output": "The service is temporarily unavailable right now. Please try again later.", 
+            "facility_cards": None, 
+            "tool_names_called": []
+        }
+    except Exception as e:
+        log_error(
+            f"[{session_id[:8]}] Unexpected agent error | "
+            f"{type(e).__name__}: {e}"
+        )
+        return {
+            "output": (
+                "Something went wrong while processing your request. "
+                "Please try again later."
+            ),
+            "facility_cards": None,
+            "tool_names_called": [],
+        }
 
-        # Second manifestation of the same generation glitch: this
-        # time Groq doesn't reject it, it just leaves tool_calls
-        # empty and puts the pseudo-call text straight into
-        # content -- which would otherwise be treated as a real
-        # final answer and shown to the user verbatim.
-        if not (hasattr(response, 'tool_calls') and response.tool_calls) \
-                and _looks_like_leaked_tool_call(response.content or ""):
-            log_warn(f"[{session_id[:8]}] tool call leaked as plain text -- retrying once")
-            response = await llm.ainvoke(messages)
+    result_messages = result["messages"]
+    if not result_messages:
+        log_error(f"[{session_id[:8]}] infoAgent returned an empty messages list")
+        return {"output": GENERIC_FALLBACK_TEXT, "facility_cards": None, "tool_names_called": []}
 
-        if hasattr(response, 'tool_calls') and response.tool_calls:
-            messages.append(response)
-            for tc in response.tool_calls:
-                tool_name = tc["name"]
-                tool_args = tc["args"]
-                tool_names_called.append(tool_name)
-                log_tool(f"[{session_id[:8]}] {tool_name} | {json.dumps(tool_args, default=str)[:120]}")
-                signature = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
-                if signature in called_this_turn:
-                    log_warn(f"[{session_id[:8]}] {tool_name} duplicate call this turn -- reusing prior result, not re-invoking")
-                    messages.append(ToolMessage(content=called_this_turn[signature], tool_call_id=tc["id"]))
-                    continue
-                t_tool = time.time()
-                try:
-                    if tool_name == "google_search":
-                        tool_message = await google_search.ainvoke(tc)
-                        result = tool_message.content
-                        if tool_message.artifact:
-                            turn_cards.extend(
-                                {
-                                    "source": "not_certified",
-                                    "title": r.get("title"),
-                                    "snippet": r.get("snippet"),
-                                    "url": r.get("link"),
-                                }
-                                for r in tool_message.artifact
-                            )
-                    elif tool_name == "save_lead":
-                        result = await save_lead.ainvoke(tool_args)
-                    elif tool_name == "facility_search":
-                        tool_message = await facility_search.ainvoke(tc)
-                        result = tool_message.content
-                        # Cards already carry their own source
-                        # (cms_certified/not_certified) -- Phase 8
-                        # made facility_search decide its own
-                        # certified-vs-web-fallback split internally,
-                        # so a single call can return a mix; no more
-                        # blanket-tagging by "which tool got called."
-                        if tool_message.artifact:
-                            turn_cards.extend(tool_message.artifact)
-                        # Phase 10: the tool's own content already starts
-                        # with the exact disclosure sentence whenever a web
-                        # fallback occurred (both the "found options" and
-                        # "zero web results either" branches in search.py) --
-                        # server-enforce it below rather than trusting the
-                        # LLM's own paraphrase to relay it verbatim.
-                        if result.startswith(DISCLOSURE_PREFIX):
-                            disclosure_required = True
-                    else:
-                        result = "Unknown tool"
-                        log_warn(f"Unknown tool: {tool_name}")
-                    ms = int((time.time() - t_tool) * 1000)
-                    log_tool(f"[{session_id[:8]}] {tool_name} done | {ms}ms")
-                    called_this_turn[signature] = str(result)
-                    messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-                except Exception as e:
-                    log_error(f"Tool error | {tool_name} | {e}")
-                    messages.append(ToolMessage(content=str(e), tool_call_id=tc["id"]))
-        else:
-            total_ms = int((time.time() - t_start) * 1000)
-            log_llm(f"[{session_id[:8]}] response | {total_ms}ms | {len(response.content)} chars")
-            break
+    new_messages = result_messages[turn_length_before:]
 
-    output = response.content if response else "Something went wrong, please try again."
-    # Last-resort net: if the retry above still didn't clear a
-    # leaked tool call, never show that raw text to the user.
-    if _looks_like_leaked_tool_call(output):
-        log_warn(f"[{session_id[:8]}] final reply still looked like a leaked tool call after retry -- using fallback text")
-        output = "Sorry, I had trouble with that -- could you try rephrasing?"
-    # Phase 10: server-enforce the disclosure sentence -- the LLM's own
-    # paraphrase sometimes drops it even though the tool's content had
-    # it verbatim. Case-insensitive substring check so a reply that
-    # already relayed it correctly isn't double-disclosed.
-    if disclosure_required and DISCLOSURE_PREFIX.lower() not in output.lower():
-        log_warn(f"[{session_id[:8]}] LLM reply dropped the required disclosure -- prepending it server-side")
-        output = f"{DISCLOSURE_PREFIX} {output}"
+    response = result_messages[-1]
+    output = response.content
 
-    # Cards carry their own info -- when facility_search/google_search
-    # returned any, the frontend renders only the flashcard UI, no
-    # accompanying chat bubble.
+    tool_names_called = [m.name for m in new_messages if isinstance(m, ToolMessage)]
+    for name in tool_names_called:
+        log_tool(f"[{session_id[:8]}] {name}")
+
+    for failure in result.get("tool_failures") or []:
+        log_warn(f"[{session_id[:8]}] tool failed | {failure['tool']} | {failure['reason']}")
+
+    total_ms = int((time.time() - t_start) * 1000)
+    log_llm(f"[{session_id[:8]}] response | {total_ms}ms | {len(str(output))} chars")
+
+    turn_cards = result.get("turn_cards") or None
     if turn_cards:
         output = ""
 
-    return {"output": output, "facility_cards": turn_cards or None, "tool_names_called": tool_names_called}
+    # Final structural safety net on run_turn's own contract with
+    # websocket_endpoint -- deliberately redundant with the middleware
+    # above (which should already guarantee a good `output`), cheap
+    # insurance against this dict ever going out malformed. Blank output is
+    # only ever correct when turn_cards are present.
+    if not isinstance(output, str):
+        output = "" if turn_cards else GENERIC_FALLBACK_TEXT
+    elif not output and not turn_cards:
+        output = GENERIC_FALLBACK_TEXT
+    if turn_cards is not None and not isinstance(turn_cards, list):
+        turn_cards = None
+    if not isinstance(tool_names_called, list):
+        tool_names_called = []
+
+    return {"output": output, "facility_cards": turn_cards, "tool_names_called": tool_names_called}
 
 
 def _resolve_ws_token(token: str) -> tuple[Optional[str], bool]:
@@ -305,12 +307,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
     personalized_prompt = system_prompt + f"\n\nYour session_id for this conversation is: {session_id}\nYou MUST pass this exact session_id in every single save_lead tool call."
 
-    # First frame is either an optional auth handshake ({"token": ...}) or,
-    # for clients that don't send one, straight into a real turn
-    # ({"message": ..., "history": ...}) -- kept fully backward-compatible
-    # with clients that have no concept of the auth frame. A bounded wait
-    # (rather than an unbounded receive_json()) means a socket that's opened
-    # and never sent anything gets closed instead of held open forever.
     user_id: Optional[str] = None
     pending_turn: Optional[dict] = None
     try:
@@ -475,20 +471,18 @@ async def generate_title(req: GenerateTitleRequest, current_user=Depends(optiona
     try:
         log_api(f"Generate title | session={req.session_id[:12]}")
         title_llm = ChatGroq(api_key=os.getenv("GROQ_API_KEY"), model="llama-3.3-70b-versatile", temperature=0.3)
-        prompt = f"Generate a SHORT title and description for this chat: {req.user_message} | {req.ai_response}. Format: Title: [X] Description: [Y]"
+        prompt = f"Generate a SHORT description for this chat: {req.user_message} | {req.ai_response}. Format: Description: [X]"
         response = await title_llm.ainvoke(prompt)
-        title, description = "New Conversation", ""
+        description = "New Conversation", ""
         for line in response.content.split("\n"):
-            if line.startswith("Title:"): title = line.replace("Title:", "").strip()
-            elif line.startswith("Description:"): description = line.replace("Description:", "").strip()
-        await update_session_title(req.session_id, title, description, requester_user_id=requester_id)
-        print(title)
-        return {"title": title, "description": description}
+            if line.startswith("Description:"): description = line.replace("Description:", "").strip()
+        await update_session_title(req.session_id, description, requester_user_id=requester_id)
+        return {"description": description}
     except SessionAccessDenied:
         raise HTTPException(status_code=404, detail="Session not found")
     except Exception as e:
         log_error(f"generate_title failed | session={req.session_id[:12]} | {e}")
-        return {"title": "New Conversation", "description": ""}
+        return {"description": ""}
 
 
 class DeleteSessionRequest(BaseModel):

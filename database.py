@@ -56,12 +56,10 @@ async def create_tables():
                 id SERIAL PRIMARY KEY,
                 session_id TEXT UNIQUE NOT NULL,
                 user_id TEXT,
-                title TEXT DEFAULT 'New Conversation',
                 description TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        await conn.execute("ALTER TABLE infomary_sessions ADD COLUMN IF NOT EXISTS title TEXT DEFAULT 'New Conversation'")
         await conn.execute("ALTER TABLE infomary_sessions ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS infomary_messages (
@@ -190,13 +188,13 @@ async def fetch_history(session_id: str, requester_user_id: str | None = None):
         log_error(f"fetch_history failed | session={session_id[:12]} | {e}")
         return []
 
-async def update_session_title(session_id: str, title: str, description: str = "", requester_user_id: str | None = None):
+async def update_session_title(session_id: str, description: str = "", requester_user_id: str | None = None):
     try:
         await ensure_session_access(session_id, requester_user_id, create=False)
         async with get_db_connection() as conn:
             await conn.execute(
-                "UPDATE infomary_sessions SET title = $1, description = $2 WHERE session_id = $3",
-                title, description, session_id
+                "UPDATE infomary_sessions SET description = $1 WHERE session_id = $2",
+                description, session_id
             )
     except SessionAccessDenied:
         raise
@@ -210,11 +208,11 @@ async def get_all_sessions(user_id: str | None = None):
     try:
         async with get_db_connection() as conn:
             rows = await conn.fetch(
-                "SELECT session_id, title, description, created_at FROM infomary_sessions "
+                "SELECT session_id, description, created_at FROM infomary_sessions "
                 "WHERE user_id = $1 ORDER BY created_at DESC",
                 user_id
             )
-            return [{"session_id": r["session_id"], "title": r["title"], "description": r["description"], "created_at": str(r["created_at"])} for r in rows]
+            return [{"session_id": r["session_id"], "description": r["description"], "created_at": str(r["created_at"])} for r in rows]
     except Exception as e:
         log_error(f"get_all_sessions failed | {e}")
         return []

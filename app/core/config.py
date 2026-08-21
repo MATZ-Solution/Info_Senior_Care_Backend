@@ -259,7 +259,7 @@ class Settings(BaseSettings):
     CACHE_TTL_SECONDS: int = 180
 
     # ---- CORS ----
-    CORS_ORIGINS: List[str] = ["http://localhost:8081"]
+    CORS_ORIGINS: List[str] = CORS_ORIGINS or "http://localhost:8081"
 
     # ---- Rate limiting ----
     RATE_LIMIT_PER_MINUTE: int = 60
